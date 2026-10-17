@@ -83,8 +83,8 @@ class RadioController(
             .distinctUntilChanged()
             .onEach { (khz, name) ->
                 if (name == null) return@onEach
-                if (presets.value.none { it?.frequencyKhz == khz && it.name != name }) return@onEach
-                store.updatePresets { list -> list.map { if (it?.frequencyKhz == khz) it.copy(name = name) else it } }
+                if (presets.value.none { it != null && it.frequencyKhz == khz && it.name != name }) return@onEach
+                store.updatePresets { list -> list.map { if (it != null && it.frequencyKhz == khz) it.copy(name = name) else it } }
             }
             .launchIn(scope)
     }
