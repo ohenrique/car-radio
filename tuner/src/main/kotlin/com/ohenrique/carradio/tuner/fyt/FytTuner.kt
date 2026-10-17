@@ -14,8 +14,11 @@ import com.ohenrique.carradio.tuner.fyt.Syu.Main
 import com.ohenrique.carradio.tuner.fyt.Syu.Radio
 import com.ohenrique.carradio.tuner.fyt.Syu.Sound
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -23,8 +26,10 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.math.abs
 
 /**
  * Radio on FYT head units (UIS7862, UIS8581, UIS7870...), driven through the `com.syu.ms` service
@@ -58,16 +63,21 @@ class FytTuner(
     override val state: StateFlow<TunerState> = _state.asStateFlow()
 
     private val operation = Mutex()
-    private var toolkit: SyuToolkit? = null
-    private var main: SyuModule? = null
-    private var radio: SyuModule? = null
-    private var sound: SyuModule? = null
+
+    // Cleared from a Binder thread when the service dies.
+    @Volatile private var toolkit: SyuToolkit? = null
+    @Volatile private var main: SyuModule? = null
+    @Volatile private var radio: SyuModule? = null
+    @Volatile private var sound: SyuModule? = null
 
     // Written from Binder threads.
     private val appId = MutableStateFlow<Int?>(null)
     @Volatile private var soundMuted = false
+    /** A [Sound.VOL_MUTE] sent by this app is in force. It silences the whole head unit. */
+    @Volatile private var mutedByApp = false
     @Volatile private var fmInKhz: Boolean? = null
-    @Volatile private var onAmBand = false
+    /** False while the MCU is on the AM band. */
+    private val onFm = MutableStateFlow(true)
     private val frequencyKnown = MutableStateFlow(false)
     private val searchState = MutableStateFlow(Radio.SEARCH_STATE_NONE)
 
@@ -93,9 +103,7 @@ class FytTuner(
             val toolkit = withTimeout(timing.connectMs) { connect() }
             this.toolkit = toolkit
             toolkit.listener = ::onUpdate
-            toolkit.onDisconnected = {
-                _state.update { it.copy(power = PowerState.ERROR, error = "A conexão com o serviço com.syu.ms caiu") }
-            }
+            toolkit.onDisconnected = { fail(CONNECTION_LOST) }
             main = toolkit.module(Syu.MODULE_MAIN)
             sound = toolkit.module(Syu.MODULE_SOUND)
             radio = toolkit.module(Syu.MODULE_RADIO)
@@ -109,7 +117,7 @@ class FytTuner(
             if (main != null) withTimeoutOrNull(timing.echoMs) { appId.first { it != null } }
             claimSource()
             withTimeoutOrNull(timing.settleMs) { frequencyKnown.first { it } }
-            if (onAmBand) radio?.cmd(Radio.C_BAND, Radio.BAND_SWITCH_FM)
+            ensureFm()
             syncSensitivity()
             syncRds()
             syncStereo()
@@ -129,6 +137,9 @@ class FytTuner(
     override suspend fun powerOff() {
         // The radio stays the MCU's source: releasing it makes the MCU jump to another one.
         toolkit?.let { tk ->
+            // But do not leave the whole unit muted by the radio's mute.
+            if (mutedByApp) runCatching { sound?.cmd(Sound.C_VOL, Sound.VOL_UNMUTE) }
+            mutedByApp = false
             RADIO_UPDATES.forEach { runCatching { radio?.unregister(it) } }
             runCatching { main?.unregister(Main.U_APP_ID) }
             runCatching { sound?.unregister(Sound.U_MUTE) }
@@ -147,11 +158,18 @@ class FytTuner(
         val radio = radio ?: return
         operation.withLock {
             val target = clampToBand(frequencyKhz)
-            if (frequencyKnown.value && target == _state.value.frequencyKhz) return
+            awaitSearchEnd()
+            if (isAt(target)) return
             ensureSource()
+            ensureFm()
             if (directTuneWorks != false) {
                 radio.cmd(Radio.C_FREQ, Radio.FREQ_DIRECT, toMcu(target))
-                val reached = withTimeoutOrNull(timing.directTuneMs) { state.first { it.frequencyKhz == target } } != null
+                var reached = withTimeoutOrNull(timing.directTuneMs) { state.first { isAt(target) } } != null
+                if (!reached) {
+                    // A slow MCU may still be on its way there.
+                    awaitQuiet()
+                    reached = isAt(target)
+                }
                 if (reached) {
                     directTuneWorks = true
                     return
@@ -165,7 +183,9 @@ class FytTuner(
     override suspend fun seek(direction: SeekDirection, wrap: Boolean): FoundStation? {
         val radio = radio ?: return null
         return operation.withLock {
+            awaitSearchEnd()
             ensureSource()
+            ensureFm()
             val origin = _state.value.frequencyKhz
             _state.update { it.copy(activity = TunerActivity.SEEKING) }
             try {
@@ -190,14 +210,22 @@ class FytTuner(
     }
 
     override suspend fun setMuted(muted: Boolean) {
-        if (muted) {
-            // Only mute while the radio is what is playing; otherwise this would mute another source.
-            if (radioIsSource()) sound?.cmd(Sound.C_VOL, Sound.VOL_MUTE)
+        if (!muted) return claimSource()
+        // VOL_MUTE silences the whole head unit, so it is only sent while the radio is what plays,
+        // and taken back as soon as another source gets the speakers (see onSourceChanged).
+        val sound = sound
+        if (sound != null && radioIsSource() && !inCall()) {
+            sound.cmd(Sound.C_VOL, Sound.VOL_MUTE)
             soundMuted = true
-            refreshMuted()
-        } else {
-            claimSource()
+            mutedByApp = true
         }
+        refreshMuted()
+    }
+
+    override suspend fun reclaimSource() {
+        if (radio == null || radioIsSource() || inCall()) return
+        switchSource()
+        refreshMuted()
     }
 
     override suspend fun setForceMono(forceMono: Boolean) {
@@ -236,23 +264,37 @@ class FytTuner(
         stereoTouched = true
     }
 
-    /** Makes the radio the MCU's active source and unmutes it. */
+    /** Makes the radio the MCU's active source and unmutes it, unless a phone call has the speakers. */
     private suspend fun claimSource() {
-        val main = main
-        main?.cmd(Main.C_APP_ID, Main.APP_ID_RADIO)
+        if (inCall()) return
+        switchSource()
         sound?.cmd(Sound.C_VOL, Sound.VOL_UNMUTE)
         soundMuted = false
-        if (main != null && !awaitRadioSource()) {
+        mutedByApp = false
+        refreshMuted()
+    }
+
+    private suspend fun switchSource() {
+        val main = main ?: return
+        if (appId.value.let { it == Main.APP_ID_RADIO || it == Main.APP_ID_CAR_RADIO }) return
+        main.cmd(Main.C_APP_ID, Main.APP_ID_RADIO)
+        if (!awaitRadioSource()) {
             // Some FYT builds call the radio source "car radio".
             main.cmd(Main.C_APP_ID, Main.APP_ID_CAR_RADIO)
             main.cmd(Main.C_APP_ID, Main.APP_ID_RADIO)
             awaitRadioSource()
         }
-        refreshMuted()
     }
 
     private suspend fun ensureSource() {
         if (!radioIsSource()) claimSource()
+    }
+
+    /** Switches back to FM when the MCU was left on AM, by the stock radio for instance. */
+    private suspend fun ensureFm() {
+        if (onFm.value) return
+        radio?.cmd(Radio.C_BAND, Radio.BAND_SWITCH_FM)
+        withTimeoutOrNull(timing.settleMs) { onFm.first { it } }
     }
 
     private suspend fun awaitRadioSource(): Boolean =
@@ -263,22 +305,58 @@ class FytTuner(
 
     private fun isRadio(id: Int?) = id == null || id == Main.APP_ID_RADIO || id == Main.APP_ID_CAR_RADIO
 
+    private fun inCall(): Boolean = appId.value in PHONE_APP_IDS
+
+    private fun isAt(frequencyKhz: Int) = frequencyKnown.value && _state.value.frequencyKhz == frequencyKhz
+
     /** Walks one channel at a time, waiting for the MCU to echo each step, until [target]. */
     private suspend fun stepTo(radio: SyuModule, target: Int) {
+        // Never step from a frequency the MCU did not report.
+        if (withTimeoutOrNull(timing.echoMs) { frequencyKnown.first { it } } == null) return
+        // Let the echoes of a cancelled tune, or a seek still running, arrive before reading the dial.
+        awaitQuiet()
+        val span = _state.value.region.let { it.maxKhz - it.minKhz }
         repeat(MAX_STEPS) {
             val current = _state.value.frequencyKhz
             if (current == target) return
             val up = target > current
-            radio.cmd(if (up) Radio.C_FREQ_UP else Radio.C_FREQ_DOWN)
-            val next = withTimeoutOrNull(timing.echoMs) { state.first { it.frequencyKhz != current } }?.frequencyKhz
-                ?: return
-            val wrapped = if (up) next < current else next > current
-            if (wrapped) {
+            val next = step(radio, if (up) Radio.C_FREQ_UP else Radio.C_FREQ_DOWN, current) ?: return
+            if (abs(next - current) > span / 2) {
                 // Went past the band edge and came out at the other end: step back and stop.
-                radio.cmd(if (up) Radio.C_FREQ_DOWN else Radio.C_FREQ_UP)
+                step(radio, if (up) Radio.C_FREQ_DOWN else Radio.C_FREQ_UP, next)
                 return
             }
             if (if (up) next > target else next < target) return
+        }
+    }
+
+    /** Sends one step and waits for its echo, which a cancellation must not separate from it. */
+    private suspend fun step(radio: SyuModule, command: Int, from: Int): Int? {
+        radio.cmd(command)
+        val next = withContext(NonCancellable) {
+            withTimeoutOrNull(timing.echoMs) { state.first { it.frequencyKhz != from } }
+        }?.frequencyKhz
+        currentCoroutineContext().ensureActive()
+        return next
+    }
+
+    /**
+     * Lets a seek the MCU is still running (one whose request was cancelled here) finish, since
+     * there is no command to stop it and the dial would keep moving under a new tune.
+     */
+    private suspend fun awaitSearchEnd() {
+        if (searchState.value == Radio.SEARCH_STATE_NONE) return
+        withTimeoutOrNull(timing.seekMaxMs) { searchState.first { it == Radio.SEARCH_STATE_NONE } }
+        delay(timing.seekTailMs)
+    }
+
+    /** Waits until the MCU has stopped reporting frequency changes for a moment. */
+    private suspend fun awaitQuiet() {
+        withTimeoutOrNull(timing.seekMaxMs) {
+            while (true) {
+                val last = _state.value.frequencyKhz
+                withTimeoutOrNull(timing.echoMs) { state.first { it.frequencyKhz != last } } ?: break
+            }
         }
     }
 
@@ -295,10 +373,7 @@ class FytTuner(
 
     private fun onUpdate(update: SyuUpdate) {
         when (update.module) {
-            Syu.MODULE_MAIN -> if (update.code == Main.U_APP_ID) {
-                appId.value = update.int()
-                refreshMuted()
-            }
+            Syu.MODULE_MAIN -> if (update.code == Main.U_APP_ID) onSourceChanged(update.int())
             Syu.MODULE_SOUND -> if (update.code == Sound.U_MUTE) {
                 soundMuted = (update.int() ?: 0) != 0
                 refreshMuted()
@@ -307,14 +382,31 @@ class FytTuner(
         }
     }
 
+    private fun onSourceChanged(id: Int?) {
+        appId.value = id
+        if (mutedByApp && !isRadio(id)) {
+            // Another source took the speakers: it must not play into the radio's mute.
+            mutedByApp = false
+            soundMuted = false
+            runCatching { sound?.cmd(Sound.C_VOL, Sound.VOL_UNMUTE) }
+        }
+        refreshMuted()
+    }
+
     private fun onRadioUpdate(update: SyuUpdate) {
         when (update.code) {
             Radio.U_FREQ -> {
-                val khz = update.int()?.let(::fromMcu) ?: return
-                _state.update { if (it.frequencyKhz == khz) it else it.copy(frequencyKhz = khz, rds = RdsInfo.EMPTY) }
+                val value = update.int() ?: return
+                // FM and AM share this update; AM is in kHz and always below 5000.
+                if (value < AM_MAX) {
+                    onFm.value = false
+                    return
+                }
+                val khz = fromMcu(value) ?: return
+                onFm.value = true
                 frequencyKnown.value = true
+                _state.update { if (it.frequencyKhz == khz) it else it.copy(frequencyKhz = khz, rds = RdsInfo.EMPTY) }
             }
-            Radio.U_BAND -> onAmBand = (update.int() ?: Radio.BAND_FM_INDEX_BEGIN) < Radio.BAND_FM_INDEX_BEGIN
             Radio.U_EXTRA_FREQ_INFO -> onBandInfo(update.ints ?: return)
             Radio.U_STEREO -> _state.update { it.copy(signal = SignalInfo(stereo = (update.int() ?: 0) != 0)) }
             Radio.U_SEARCH_STATE -> searchState.value = update.int() ?: Radio.SEARCH_STATE_NONE
@@ -362,7 +454,7 @@ class FytTuner(
     private fun fromMcu(value: Int): Int? = when {
         value >= 50_000 -> value
         value in 5_000..20_000 -> value * 10
-        else -> null // AM, in kHz
+        else -> null
     }
 
     private fun toMcu(frequencyKhz: Int): Int = if (fmInKhz == true) frequencyKhz else frequencyKhz / 10
@@ -373,15 +465,22 @@ class FytTuner(
         main = null
         radio = null
         sound = null
+        tk?.listener = null
+        tk?.onDisconnected = null
         runCatching { tk?.close() }
-        _state.update { it.copy(power = PowerState.ERROR, error = message) }
+        _state.update { it.copy(power = PowerState.ERROR, activity = TunerActivity.IDLE, error = message) }
     }
 
     companion object {
+        /** The error shown when the service went away while the radio was on; the app reconnects on it. */
+        const val CONNECTION_LOST = "A conexão com o serviço com.syu.ms caiu"
+
         private const val MAX_STEPS = 400
+        private const val AM_MAX = 5_000
+
+        private val PHONE_APP_IDS = setOf(Main.APP_ID_BTPHONE, Main.APP_ID_CAR_BTPHONE, Main.APP_ID_3GPHONE)
 
         private val RADIO_UPDATES = listOf(
-            Radio.U_BAND,
             Radio.U_FREQ,
             Radio.U_EXTRA_FREQ_INFO,
             Radio.U_STEREO,

@@ -22,6 +22,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -90,6 +91,14 @@ class RadioController(
                 store.updatePresets { list -> list.map { if (it != null && it.frequencyKhz == khz) it.copy(name = name) else it } }
             }
             .launchIn(scope)
+
+        // com.syu.ms can restart (a system update, a crash); bind it again when it does.
+        state.filter { it.power == PowerState.ERROR && it.error == FytTuner.CONNECTION_LOST }
+            .onEach {
+                delay(RECONNECT_DELAY_MS)
+                start()
+            }
+            .launchIn(scope)
     }
 
     /**
@@ -101,8 +110,7 @@ class RadioController(
             lifecycle.withLock {
                 val settings = store.settings.first()
                 if (state.value.power == PowerState.ON && settings == activeSettings) {
-                    val tuner = _tuner.value
-                    if (tuner.managesAudioSource) runCatching { tuner.setMuted(false) }
+                    runCatching { _tuner.value.reclaimSource() }
                     return@withLock
                 }
                 restart(settings)
@@ -128,9 +136,11 @@ class RadioController(
                 val active = activeSettings
                 if (active != null && !needsRestart(active, settings)) {
                     val tuner = _tuner.value
-                    tuner.setSensitivity(settings.sensitivity)
-                    tuner.setForceMono(settings.forceMono)
-                    tuner.setRdsEnabled(settings.rdsEnabled)
+                    runCatching {
+                        tuner.setSensitivity(settings.sensitivity)
+                        tuner.setForceMono(settings.forceMono)
+                        tuner.setRdsEnabled(settings.rdsEnabled)
+                    }
                     activeSettings = settings
                 } else {
                     restart(settings)
@@ -258,5 +268,9 @@ class RadioController(
                 clockHz = settings.clockHz,
             ),
         )
+    }
+
+    private companion object {
+        const val RECONNECT_DELAY_MS = 2_000L
     }
 }

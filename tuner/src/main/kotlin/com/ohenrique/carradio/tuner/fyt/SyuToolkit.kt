@@ -54,6 +54,8 @@ class SyuException(message: String, cause: Throwable? = null) : IOException(mess
 object Syu {
     const val PACKAGE = "com.syu.ms"
     const val TOOLKIT_ACTION = "com.syu.ms.toolkit"
+    /** The service class inside [PACKAGE], for firmware that does not resolve [TOOLKIT_ACTION]. */
+    const val TOOLKIT_SERVICE = "app.ToolkitService"
 
     const val MODULE_MAIN = 0
     const val MODULE_RADIO = 1
@@ -68,6 +70,11 @@ object Syu {
         const val APP_ID_RADIO = 1
         /** Used instead of [APP_ID_RADIO] by some FYT builds. */
         const val APP_ID_CAR_RADIO = 11
+
+        // Phone calls, which own the speakers until they end.
+        const val APP_ID_BTPHONE = 2
+        const val APP_ID_CAR_BTPHONE = 12
+        const val APP_ID_3GPHONE = 15
     }
 
     object Radio {
@@ -85,7 +92,7 @@ object Syu {
         /** FinalRadio's modes for [C_FREQ]. */
         const val FREQ_DIRECT = 1
 
-        const val U_BAND = 0
+        /** ints[0] = frequency: FM in 10 kHz units (kHz on older firmware), AM in kHz. */
         const val U_FREQ = 1
         const val U_PTY_ID = 5
         const val U_RDS_TEXT = 13
@@ -97,8 +104,6 @@ object Syu {
         const val U_LOC = 23
         const val U_PS_TEXT = 26
 
-        /** U_BAND values at or above this are FM bands (FM1..FM3); below are AM. */
-        const val BAND_FM_INDEX_BEGIN = 65536
         const val SEARCH_STATE_NONE = 0
     }
 

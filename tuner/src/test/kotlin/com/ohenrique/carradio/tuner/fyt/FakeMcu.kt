@@ -6,13 +6,16 @@ import com.ohenrique.carradio.tuner.fyt.Syu.Sound
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 
 /**
  * The com.syu.ms service and the MCU behind it, as far as the radio is concerned. Frequencies are
- * in the MCU's own unit ([unit] kHz per count: 10 on UIS7862/8581, 1 on older firmware).
+ * in the MCU's own unit ([min], [max] and [step] tell which: 10 kHz on UIS7862/8581, kHz on older
+ * firmware).
  *
- * Updates are delivered on the caller's thread, right away, unless [seekScope] is given: then a
- * seek runs in the background one channel per [seekStepMs], like the real MCU.
+ * Updates are delivered on the caller's thread, right away, unless [scope] is given: then the MCU
+ * answers in the background like the real one, a seek moving one channel per [seekStepMs] and
+ * each step or direct tune echoing after [echoDelayMs] / [directTuneDelayMs].
  */
 class FakeMcu(
     var frequency: Int = 9_810,
@@ -25,14 +28,18 @@ class FakeMcu(
     val reportsAppId: Boolean = true,
     val directTune: Boolean = true,
     val reportsSearchState: Boolean = true,
-    val seekScope: CoroutineScope? = null,
+    val scope: CoroutineScope? = null,
     val seekStepMs: Long = 20,
+    val echoDelayMs: Long = 0,
+    val directTuneDelayMs: Long = 0,
     var local: Boolean = false,
     var rds: Boolean = true,
 ) : SyuToolkit {
     val commands = mutableListOf<Triple<Int, Int, List<Int>>>()
     var muted = true
     var closed = false
+    /** Set while the MCU is on the AM band, in kHz. */
+    var amFrequency: Int? = null
     private val registered = mutableSetOf<Pair<Int, Int>>()
 
     override var listener: ((SyuUpdate) -> Unit)? = null
@@ -49,14 +56,31 @@ class FakeMcu(
 
     fun commandsTo(module: Int, command: Int) = commands.filter { it.first == module && it.second == command }.map { it.third }
 
-    /** Another app takes the speakers, like the music player would. */
+    /** Another app takes the speakers, like the music player or a phone call would. */
     fun switchSource(id: Int) {
         appId = id
         push(Syu.MODULE_MAIN, Main.U_APP_ID, appId)
     }
 
+    /** The stock radio moves the MCU to AM. */
+    fun switchToAm(khz: Int) {
+        amFrequency = khz
+        push(Syu.MODULE_RADIO, Radio.U_FREQ, khz)
+    }
+
+    /** com.syu.ms dies. */
+    fun die() {
+        onDisconnected?.invoke()
+    }
+
+    fun pushText(code: Int, text: String) {
+        if (Syu.MODULE_RADIO to code !in registered) return
+        listener?.invoke(SyuUpdate(Syu.MODULE_RADIO, code, null, arrayOf(text)))
+    }
+
     private inner class Module(override val code: Int) : SyuModule {
         override fun cmd(command: Int, vararg ints: Int) {
+            check(!closed) { "command after close" }
             commands += Triple(code, command, ints.toList())
             when (code) {
                 Syu.MODULE_MAIN -> if (command == Main.C_APP_ID) {
@@ -83,9 +107,15 @@ class FakeMcu(
 
     private fun radioCmd(command: Int, ints: IntArray) {
         when (command) {
-            Radio.C_FREQ_UP -> moveTo(next(frequency, 1))
-            Radio.C_FREQ_DOWN -> moveTo(next(frequency, -1))
-            Radio.C_FREQ -> if (directTune && ints.size == 2 && ints[0] == Radio.FREQ_DIRECT) moveTo(ints[1])
+            Radio.C_BAND -> if (ints.first() == Radio.BAND_SWITCH_FM && amFrequency != null) {
+                amFrequency = null
+                moveTo(frequency)
+            }
+            Radio.C_FREQ_UP -> later(echoDelayMs) { moveTo(next(frequency, 1)) }
+            Radio.C_FREQ_DOWN -> later(echoDelayMs) { moveTo(next(frequency, -1)) }
+            Radio.C_FREQ -> if (directTune && ints.size == 2 && ints[0] == Radio.FREQ_DIRECT) {
+                later(directTuneDelayMs) { moveTo(ints[1]) }
+            }
             Radio.C_SEEK_UP -> seek(1)
             Radio.C_SEEK_DOWN -> seek(-1)
             Radio.C_LOC -> {
@@ -99,6 +129,13 @@ class FakeMcu(
         }
     }
 
+    private fun later(delayMs: Long, action: () -> Unit) {
+        if (scope == null) action() else scope.launch {
+            delay(delayMs)
+            action()
+        }
+    }
+
     private fun seek(delta: Int) {
         val run: suspend () -> Unit = {
             val origin = frequency
@@ -106,7 +143,7 @@ class FakeMcu(
             var f = origin
             var found = false
             for (i in 0 until (max - min) / step) {
-                if (seekScope != null) delay(seekStepMs)
+                if (scope != null) delay(seekStepMs)
                 f = next(f, delta)
                 moveTo(f)
                 if (f in stations) {
@@ -117,7 +154,7 @@ class FakeMcu(
             if (!found) moveTo(origin)
             if (reportsSearchState) push(Syu.MODULE_RADIO, Radio.U_SEARCH_STATE, Radio.SEARCH_STATE_NONE)
         }
-        if (seekScope != null) seekScope.launch { run() } else kotlinx.coroutines.runBlocking { run() }
+        if (scope != null) scope.launch { run() } else runBlocking { run() }
     }
 
     private fun next(f: Int, delta: Int): Int {
@@ -144,8 +181,7 @@ class FakeMcu(
             Syu.MODULE_MAIN -> if (code == Main.U_APP_ID && reportsAppId) push(module, code, appId)
             Syu.MODULE_SOUND -> if (code == Sound.U_MUTE) push(module, code, if (muted) 1 else 0)
             Syu.MODULE_RADIO -> when (code) {
-                Radio.U_BAND -> push(module, code, Radio.BAND_FM_INDEX_BEGIN)
-                Radio.U_FREQ -> push(module, code, frequency)
+                Radio.U_FREQ -> push(module, code, amFrequency ?: frequency)
                 Radio.U_EXTRA_FREQ_INFO -> push(module, code, min, max, step, (max - min) / step)
                 Radio.U_LOC -> push(module, code, if (local) 1 else 0)
                 Radio.U_RDS_ENABLE -> push(module, code, if (rds) 1 else 0)
@@ -153,13 +189,8 @@ class FakeMcu(
         }
     }
 
-    private fun push(module: Int, code: Int, vararg ints: Int, strings: Array<String?>? = null) {
+    private fun push(module: Int, code: Int, vararg ints: Int) {
         if (module to code !in registered) return
-        listener?.invoke(SyuUpdate(module, code, ints, strings))
-    }
-
-    fun pushText(code: Int, text: String) {
-        if (Syu.MODULE_RADIO to code !in registered) return
-        listener?.invoke(SyuUpdate(Syu.MODULE_RADIO, code, null, arrayOf(text)))
+        listener?.invoke(SyuUpdate(module, code, ints, null))
     }
 }

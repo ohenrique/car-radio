@@ -10,6 +10,8 @@ import com.ohenrique.carradio.tuner.fyt.Syu.Radio
 import com.ohenrique.carradio.tuner.fyt.Syu.Sound
 import com.ohenrique.carradio.tuner.scanBand
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -117,6 +119,85 @@ class FytTunerTest {
     }
 
     @Test
+    fun `a slow direct tune is not mistaken for a failure`() = runTest {
+        val mcu = FakeMcu(scope = backgroundScope, directTuneDelayMs = 900)
+        val tuner = FytTuner({ mcu })
+        tuner.powerOn(Region.BRAZIL, 87_900)
+
+        tuner.tune(96_100)
+        tuner.tune(98_500)
+        tuner.tune(97_000)
+
+        assertEquals(97_000, tuner.state.value.frequencyKhz)
+        assertEquals(3, mcu.commandsTo(Syu.MODULE_RADIO, Radio.C_FREQ).size)
+        assertTrue(mcu.commandsTo(Syu.MODULE_RADIO, Radio.C_FREQ_UP).isEmpty())
+        assertTrue(mcu.commandsTo(Syu.MODULE_RADIO, Radio.C_FREQ_DOWN).isEmpty())
+    }
+
+    @Test
+    fun `a cancelled step does not throw the next tune off`() = runTest {
+        val mcu = FakeMcu(scope = backgroundScope, directTune = false, echoDelayMs = 100)
+        val tuner = FytTuner({ mcu })
+        tuner.powerOn(Region.BRAZIL, 87_900)
+        // Two failed direct tunes switch to stepping.
+        tuner.tune(98_300)
+        tuner.tune(98_100)
+
+        // Cancelled while a step up is on its way, then sent the other way.
+        val interrupted = launch { tuner.tune(99_500) }
+        advanceTimeBy(450)
+        interrupted.cancel()
+        tuner.tune(98_300)
+        advanceTimeBy(2_000)
+
+        assertEquals(98_300, tuner.state.value.frequencyKhz)
+        assertEquals(9_830, mcu.frequency)
+    }
+
+    @Test
+    fun `tuning while a seek is still running lands on the target`() = runTest {
+        // The seek is still running and passes 95.0 while the tune waits for its echo.
+        val mcu = FakeMcu(frequency = 9_300, stations = setOf(10_630), scope = backgroundScope, directTune = false, echoDelayMs = 50)
+        val tuner = FytTuner({ mcu })
+        tuner.powerOn(Region.BRAZIL, 87_900)
+
+        val seeking = launch { tuner.seek(SeekDirection.UP) }
+        advanceTimeBy(300)
+        seeking.cancel()
+        tuner.tune(95_000)
+        advanceTimeBy(5_000)
+
+        assertEquals(95_000, tuner.state.value.frequencyKhz)
+        assertEquals(9_500, mcu.frequency)
+    }
+
+    @Test
+    fun `goes back to FM when the stock radio left the MCU on AM`() = runTest {
+        val mcu = FakeMcu()
+        val tuner = FytTuner({ mcu })
+        tuner.powerOn(Region.BRAZIL, 87_900)
+
+        mcu.switchToAm(1_010)
+        assertEquals(98_100, tuner.state.value.frequencyKhz)
+        tuner.tune(96_100)
+
+        assertEquals(listOf(listOf(Radio.BAND_SWITCH_FM)), mcu.commandsTo(Syu.MODULE_RADIO, Radio.C_BAND))
+        assertEquals(96_100, tuner.state.value.frequencyKhz)
+        assertEquals(9_610, mcu.frequency)
+    }
+
+    @Test
+    fun `powers on in FM when the MCU is on AM`() = runTest {
+        val mcu = FakeMcu().apply { amFrequency = 1_010 }
+        val tuner = FytTuner({ mcu })
+
+        tuner.powerOn(Region.BRAZIL, 87_900)
+
+        assertEquals(listOf(listOf(Radio.BAND_SWITCH_FM)), mcu.commandsTo(Syu.MODULE_RADIO, Radio.C_BAND))
+        assertEquals(98_100, tuner.state.value.frequencyKhz)
+    }
+
+    @Test
     fun `seek stops on the next station`() = runTest {
         val mcu = FakeMcu(frequency = 9_000)
         val tuner = FytTuner({ mcu })
@@ -133,7 +214,7 @@ class FytTunerTest {
 
     @Test
     fun `seek follows the search state of a slow MCU`() = runTest {
-        val mcu = FakeMcu(frequency = 9_000, seekScope = backgroundScope)
+        val mcu = FakeMcu(frequency = 9_000, scope = backgroundScope)
         val tuner = FytTuner({ mcu })
         tuner.powerOn(Region.BRAZIL, 87_900)
 
@@ -143,7 +224,7 @@ class FytTunerTest {
 
     @Test
     fun `seek waits for the dial to settle when the MCU reports no search state`() = runTest {
-        val mcu = FakeMcu(frequency = 9_000, seekScope = backgroundScope, reportsSearchState = false)
+        val mcu = FakeMcu(frequency = 9_000, scope = backgroundScope, reportsSearchState = false)
         val tuner = FytTuner({ mcu })
         tuner.powerOn(Region.BRAZIL, 87_900)
 
@@ -190,6 +271,104 @@ class FytTunerTest {
         assertTrue(tuner.state.value.muted)
         tuner.setMuted(true)
         assertEquals(1, mcu.commandsTo(Syu.MODULE_SOUND, Sound.C_VOL).count { it == listOf(Sound.VOL_MUTE) })
+    }
+
+    @Test
+    fun `the radio's mute is lifted when another source takes the speakers`() = runTest {
+        val mcu = FakeMcu()
+        val tuner = FytTuner({ mcu })
+        tuner.powerOn(Region.BRAZIL, 87_900)
+        tuner.setMuted(true)
+        assertTrue(mcu.muted)
+
+        mcu.switchSource(BT_MUSIC)
+
+        assertFalse(mcu.muted)
+        assertTrue(tuner.state.value.muted)
+    }
+
+    @Test
+    fun `power off does not leave the unit muted`() = runTest {
+        val mcu = FakeMcu()
+        val tuner = FytTuner({ mcu })
+        tuner.powerOn(Region.BRAZIL, 87_900)
+        tuner.setMuted(true)
+
+        tuner.powerOff()
+
+        assertFalse(mcu.muted)
+    }
+
+    @Test
+    fun `a hardware mute is left alone when the source changes`() = runTest {
+        val mcu = FakeMcu()
+        val tuner = FytTuner({ mcu })
+        tuner.powerOn(Region.BRAZIL, 87_900)
+        val unmutes = mcu.commandsTo(Syu.MODULE_SOUND, Sound.C_VOL).size
+
+        mcu.switchSource(BT_MUSIC)
+
+        assertEquals(unmutes, mcu.commandsTo(Syu.MODULE_SOUND, Sound.C_VOL).size)
+    }
+
+    @Test
+    fun `pausing while another source plays does not stick the mute icon`() = runTest {
+        val mcu = FakeMcu()
+        val tuner = FytTuner({ mcu })
+        tuner.powerOn(Region.BRAZIL, 87_900)
+        mcu.switchSource(BT_MUSIC)
+
+        tuner.setMuted(true)
+        mcu.switchSource(Main.APP_ID_RADIO)
+
+        assertFalse(tuner.state.value.muted)
+    }
+
+    @Test
+    fun `leaves the speakers to a phone call`() = runTest {
+        val mcu = FakeMcu()
+        val tuner = FytTuner({ mcu })
+        tuner.powerOn(Region.BRAZIL, 87_900)
+        mcu.switchSource(Main.APP_ID_BTPHONE)
+
+        tuner.reclaimSource()
+        tuner.setMuted(false)
+        tuner.tune(96_100)
+        assertEquals(Main.APP_ID_BTPHONE, mcu.appId)
+
+        mcu.switchSource(BT_MUSIC)
+        tuner.reclaimSource()
+        assertEquals(Main.APP_ID_RADIO, mcu.appId)
+    }
+
+    @Test
+    fun `reclaiming the source keeps the user's mute`() = runTest {
+        val mcu = FakeMcu()
+        val tuner = FytTuner({ mcu })
+        tuner.powerOn(Region.BRAZIL, 87_900)
+        tuner.setMuted(true)
+        val sent = mcu.commands.size
+
+        tuner.reclaimSource()
+
+        assertEquals(sent, mcu.commands.size)
+        assertTrue(mcu.muted)
+    }
+
+    @Test
+    fun `losing the service turns the tuner off safely`() = runTest {
+        val mcu = FakeMcu()
+        val tuner = FytTuner({ mcu })
+        tuner.powerOn(Region.BRAZIL, 87_900)
+
+        mcu.die()
+        tuner.setSensitivity(Sensitivity.LOCAL)
+        tuner.setForceMono(true)
+        tuner.tune(96_100)
+
+        assertEquals(PowerState.ERROR, tuner.state.value.power)
+        assertEquals(FytTuner.CONNECTION_LOST, tuner.state.value.error)
+        assertTrue(mcu.closed)
     }
 
     @Test
@@ -295,3 +474,6 @@ class FytTunerTest {
         assertEquals("com.syu.ms não está instalado", tuner.state.value.error)
     }
 }
+
+/** FinalMain.APP_ID_BTAV: Bluetooth music. */
+private const val BT_MUSIC = 3

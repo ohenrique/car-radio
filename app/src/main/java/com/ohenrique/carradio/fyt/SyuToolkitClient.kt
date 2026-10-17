@@ -186,15 +186,29 @@ class SyuToolkitClient private constructor(
                         if (cont.isActive) cont.resumeWithException(SyuException("O com.syu.ms não entregou o serviço de rádio"))
                     }
                 }
-                val intent = Intent(Syu.TOOLKIT_ACTION).setPackage(Syu.PACKAGE)
-                val bound = try {
-                    app.bindService(intent, connection, Context.BIND_AUTO_CREATE)
-                } catch (e: SecurityException) {
-                    cont.resumeWithException(SyuException("O Android não deixou o app se ligar ao com.syu.ms", e))
-                    return@suspendCancellableCoroutine
+                // The stock FYT clients use both forms: the action within the package, and the
+                // service class by name.
+                val intents = listOf(
+                    Intent(Syu.TOOLKIT_ACTION).setPackage(Syu.PACKAGE),
+                    Intent(Syu.TOOLKIT_ACTION).setComponent(ComponentName(Syu.PACKAGE, Syu.TOOLKIT_SERVICE)),
+                )
+                var denied: SecurityException? = null
+                val bound = intents.any { intent ->
+                    try {
+                        app.bindService(intent, connection, Context.BIND_AUTO_CREATE).also { ok ->
+                            // A failed bind still has to be unbound before trying again.
+                            if (!ok) runCatching { app.unbindService(connection) }
+                        }
+                    } catch (e: SecurityException) {
+                        denied = e
+                        false
+                    }
                 }
                 if (!bound) {
-                    runCatching { app.unbindService(connection) }
+                    denied?.let {
+                        cont.resumeWithException(SyuException("O Android não deixou o app se ligar ao com.syu.ms", it))
+                        return@suspendCancellableCoroutine
+                    }
                     cont.resumeWithException(
                         SyuException("Não encontrei o serviço com.syu.ms. Essa central é FYT? Se não for, troque o sintonizador nos ajustes."),
                     )

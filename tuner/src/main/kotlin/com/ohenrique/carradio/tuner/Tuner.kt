@@ -37,6 +37,12 @@ interface Tuner {
 
     suspend fun setMuted(muted: Boolean)
 
+    /**
+     * Brings the radio back to the speakers when the head unit switched to another source, as a
+     * stock radio does when it is opened. Leaves a mute the user chose alone.
+     */
+    suspend fun reclaimSource() {}
+
     suspend fun setForceMono(forceMono: Boolean)
 
     suspend fun setSensitivity(sensitivity: Sensitivity)

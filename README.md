@@ -45,6 +45,7 @@ Fontes: o launcher FYT descompilado em [vasyl91/FYT-Launcher-Mod](https://github
 
 Limitações conhecidas:
 
+- O mudo do app é o mudo geral da central. Por isso ele só é usado enquanto o rádio está tocando, e o app o desfaz quando outra fonte assume os alto-falantes. Durante uma ligação o app não tira o som do telefone para o rádio.
 - O MCU não informa a intensidade do sinal, então nas centrais FYT o indicador de sinal fica escondido e a busca automática guarda as estações na ordem da faixa.
 - Pelo I2C (QN8035) o app sintoniza o chip, mas quem liga o áudio do rádio nos alto-falantes é o MCU, então esse caminho em geral fica mudo nas centrais FYT.
 
