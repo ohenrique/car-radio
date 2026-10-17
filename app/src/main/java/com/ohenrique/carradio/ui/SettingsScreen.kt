@@ -68,12 +68,13 @@ fun SettingsScreen(ui: RadioUiState, onBack: () -> Unit, onChange: ((RadioSettin
             Setting(
                 "Sintonizador",
                 when (settings.backend) {
+                    TunerBackend.FYT -> "Centrais FYT (UIS7862, UIS8581): usa o serviço com.syu.ms do sistema, como o rádio original. Não precisa de root."
                     TunerBackend.QN8035 -> "Controla o chip QN8035 direto pelo barramento I2C. Precisa de root e das ferramentas i2cget/i2cset."
                     TunerBackend.SIMULATOR -> "Estações de mentira, para testar o app fora do carro."
                 },
             ) {
                 Choices(
-                    listOf(TunerBackend.QN8035 to "QN8035 (I2C)", TunerBackend.SIMULATOR to "Simulador"),
+                    listOf(TunerBackend.FYT to "FYT", TunerBackend.QN8035 to "QN8035 (I2C)", TunerBackend.SIMULATOR to "Simulador"),
                     settings.backend,
                 ) { value -> onChange { it.copy(backend = value) } }
             }
@@ -101,7 +102,8 @@ fun SettingsScreen(ui: RadioUiState, onBack: () -> Unit, onChange: ((RadioSettin
                 }
             }
 
-            Setting("Região", "Brasil inclui a faixa estendida de 76,1 a 87,9 MHz.") {
+            // On FYT units the band comes from the head unit's own radio region setting.
+            if (settings.backend != TunerBackend.FYT) Setting("Região", "Brasil inclui a faixa estendida de 76,1 a 87,9 MHz.") {
                 Choices(
                     listOf(
                         Region.BRAZIL to "Brasil",

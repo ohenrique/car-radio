@@ -124,6 +124,9 @@ class RadioPlaybackService : Service() {
     }
 
     private fun onFocusChange(change: Int) {
+        // On FYT units the MCU switches the speakers between sources by itself, and muting here
+        // could silence the app that just took over.
+        if (radio.tuner.value.managesAudioSource) return
         when (change) {
             AudioManager.AUDIOFOCUS_GAIN -> if (mutedByFocusLoss) {
                 mutedByFocusLoss = false

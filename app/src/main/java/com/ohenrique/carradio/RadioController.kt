@@ -11,6 +11,8 @@ import com.ohenrique.carradio.tuner.Sensitivity
 import com.ohenrique.carradio.tuner.Tuner
 import com.ohenrique.carradio.tuner.TunerActivity
 import com.ohenrique.carradio.tuner.TunerState
+import com.ohenrique.carradio.tuner.fyt.FytTuner
+import com.ohenrique.carradio.tuner.fyt.SyuToolkit
 import com.ohenrique.carradio.tuner.qn8035.Qn8035Config
 import com.ohenrique.carradio.tuner.qn8035.Qn8035Tuner
 import com.ohenrique.carradio.tuner.scanBand
@@ -45,6 +47,7 @@ import kotlinx.coroutines.sync.withLock
 class RadioController(
     private val store: RadioStore,
     private val scope: CoroutineScope,
+    private val connectFyt: suspend () -> SyuToolkit,
 ) {
     private val _tuner = MutableStateFlow<Tuner>(SimulatedTuner())
     val tuner: StateFlow<Tuner> = _tuner.asStateFlow()
@@ -89,12 +92,19 @@ class RadioController(
             .launchIn(scope)
     }
 
-    /** Powers the tuner on with the saved settings, unless it is already running. */
+    /**
+     * Powers the tuner on with the saved settings, unless it is already running. Opening the app
+     * also takes the speakers back when the head unit had switched to another source.
+     */
     fun start() {
         scope.launch {
             lifecycle.withLock {
                 val settings = store.settings.first()
-                if (state.value.power == PowerState.ON && settings == activeSettings) return@withLock
+                if (state.value.power == PowerState.ON && settings == activeSettings) {
+                    val tuner = _tuner.value
+                    if (tuner.managesAudioSource) runCatching { tuner.setMuted(false) }
+                    return@withLock
+                }
                 restart(settings)
             }
         }
@@ -182,8 +192,10 @@ class RadioController(
         scope.launch { runCatching { _tuner.value.setMuted(muted) } }
     }
 
-    fun toggleSensitivity() = updateSettings {
-        it.copy(sensitivity = if (it.sensitivity == Sensitivity.DX) Sensitivity.LOCAL else Sensitivity.DX)
+    /** Flips what the tuner is actually using, which on FYT units may differ from the saved setting. */
+    fun toggleSensitivity() {
+        val next = if (state.value.sensitivity == Sensitivity.DX) Sensitivity.LOCAL else Sensitivity.DX
+        updateSettings { it.copy(sensitivity = next) }
     }
 
     /** Scans the whole band and fills the presets with the strongest stations, like a stock radio. */
@@ -237,6 +249,7 @@ class RadioController(
             old.clockHz != new.clockHz || old.region != new.region
 
     private fun createTuner(settings: RadioSettings): Tuner = when (settings.backend) {
+        TunerBackend.FYT -> FytTuner(connectFyt)
         TunerBackend.SIMULATOR -> SimulatedTuner()
         TunerBackend.QN8035 -> Qn8035Tuner(
             Qn8035Config(

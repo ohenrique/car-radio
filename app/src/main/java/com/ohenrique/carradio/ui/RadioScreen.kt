@@ -150,8 +150,11 @@ private fun TopBar(
         Indicator("ST", tuner.signal.stereo && tuner.power == PowerState.ON)
         Spacer(Modifier.width(12.dp))
         Indicator("RDS", tuner.rds.programService != null)
-        Spacer(Modifier.width(14.dp))
-        SignalBars(if (tuner.power == PowerState.ON) tuner.signal.bars else 0)
+        // FYT units do not report signal strength.
+        if (ui.settings.backend != TunerBackend.FYT) {
+            Spacer(Modifier.width(14.dp))
+            SignalBars(if (tuner.power == PowerState.ON) tuner.signal.bars else 0)
+        }
         if (ui.settings.backend == TunerBackend.SIMULATOR) {
             Spacer(Modifier.width(14.dp))
             Text("SIMULADOR", color = RadioColors.TextFaint, fontSize = 12.sp, letterSpacing = 1.5.sp)

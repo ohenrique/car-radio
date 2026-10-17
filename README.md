@@ -1,6 +1,6 @@
 # Car Radio
 
-Rádio FM minimalista para a central multimídia **Adak Link8wf** (Android), usando a antena do carro.
+Rádio FM minimalista para a central multimídia **Adak Link8wf** (Android, plataforma FYT com Unisoc UIS8581), usando a antena do carro.
 
 ## Instalar
 
@@ -15,27 +15,44 @@ Baixe o `car-radio.apk` da release [Versão de teste](../../releases/tag/teste),
 - LOC/DX, estéreo ou mono, e RDS (nome da rádio e texto).
 - Volta para a última estação ao abrir.
 - Botões do volante e controles na notificação, por media session.
-- Região Brasil por padrão, incluindo a faixa estendida de 76,1 a 87,9 MHz.
+- Nas centrais FYT, a faixa e o passo vêm da região de rádio configurada na própria central. Nos outros sintonizadores, Brasil é o padrão, incluindo a faixa estendida de 76,1 a 87,9 MHz.
 
 ## Como o rádio é controlado
 
-O app conversa com o rádio por uma interface única, `Tuner` (no módulo `tuner`), e a tela não sabe qual hardware está por trás. Hoje existem duas implementações:
+O app conversa com o rádio por uma interface única, `Tuner` (no módulo `tuner`), e a tela não sabe qual hardware está por trás. Hoje existem três implementações, escolhidas em Ajustes:
 
 | Sintonizador | Como funciona | Requisitos |
 | --- | --- | --- |
+| `FytTuner` (padrão) | Fala com o serviço de sistema `com.syu.ms` das centrais FYT, o mesmo que o rádio original usa. Faz o MCU trocar a fonte de áudio para o rádio, sintoniza, busca, e recebe frequência, estéreo e RDS do MCU. | Central FYT (UIS7862, UIS8581, UIS7870). Sem root. |
 | `Qn8035Tuner` | Fala direto com o chip QN8035 da Link8wf pelo I2C (`i2cget`/`i2cset`), seguindo o datasheet: sintonia, busca por hardware (CCA), sinal e RDS. Procura o chip sozinho em `/dev/i2c-*`. | Root e i2c-tools ou busybox na central. |
 | `SimulatedTuner` | Estações fictícias, para usar o app fora do carro. | Nenhum. |
 
+### Protocolo do com.syu.ms
+
+O app se liga ao serviço com a ação `com.syu.ms.toolkit` no pacote `com.syu.ms` e pede um módulo por código (0 principal, 1 rádio, 4 som). Cada módulo aceita comandos `cmd(código, ints)` e envia atualizações para quem se registrou. As chamadas são Binder cru (`app/.../fyt/SyuToolkitClient.kt`), sem classes do fabricante.
+
+| O quê | Comando |
+| --- | --- |
+| Pôr o rádio nos alto-falantes | principal `0` com `[1]` (algumas versões usam `[11]`) |
+| Tirar e pôr o mudo | som `0` com `[-3]` / `[-4]` |
+| Subir ou descer um canal | rádio `3` / `4` |
+| Buscar para cima ou para baixo | rádio `5` / `6` |
+| Sintonizar direto | rádio `13` com `[1, frequência]` (ainda não confirmado; se não funcionar, o app sobe ou desce canal por canal) |
+
+Atualizações usadas: frequência (rádio `1`), faixa (`16`, `[mín, máx, passo, canais]`), estéreo (`21`), estado da busca (`22`), LOC (`23`), nome da rádio (`14` e `26`), texto RDS (`13`), fonte ativa (principal `0`) e mudo (som `3`). Nas UIS7862/8581 o FM vem em unidades de 10 kHz (8750 = 87,50 MHz); o app detecta a unidade pela faixa que o MCU informa.
+
+Fontes: o launcher FYT descompilado em [vasyl91/FYT-Launcher-Mod](https://github.com/vasyl91/FYT-Launcher-Mod) (classes `com.syu.ipc`) e o app aberto [PimpinPumpkin/FytRadio](https://github.com/PimpinPumpkin/FytRadio). Nenhum código do NavRadio+ foi usado.
+
 Limitações conhecidas:
 
-- Na maioria das centrais chinesas, quem liga o áudio do rádio nos alto-falantes é o MCU, quando o app de rádio original é aberto. Pelo I2C o app sintoniza o chip, mas pode ser preciso abrir o rádio original uma vez para o MCU trocar a fonte de áudio.
-- Apps como o NavRadio+ não usam root: eles falam com o serviço do fabricante (por exemplo `com.syu.ms` nas centrais FYT, ou `android.tw.john.TWUtil` nas TopWay). Quando soubermos qual plataforma a Link8wf usa, esse caminho entra como uma nova implementação de `Tuner`, sem mudar a tela.
+- O MCU não informa a intensidade do sinal, então nas centrais FYT o indicador de sinal fica escondido e a busca automática guarda as estações na ordem da faixa.
+- Pelo I2C (QN8035) o app sintoniza o chip, mas quem liga o áudio do rádio nos alto-falantes é o MCU, então esse caminho em geral fica mudo nas centrais FYT.
 
 ## Estrutura
 
 ```
-tuner/   Kotlin puro, testável sem Android: interface Tuner, QN8035, RDS, simulador
-app/     App Android (Jetpack Compose): tela, memórias, ajustes, media session
+tuner/   Kotlin puro, testável sem Android: interface Tuner, FYT, QN8035, RDS, simulador
+app/     App Android (Jetpack Compose): tela, memórias, ajustes, media session, cliente Binder do com.syu.ms
 ```
 
 ## Compilar

@@ -15,13 +15,18 @@ import kotlinx.coroutines.flow.map
 import org.json.JSONArray
 import org.json.JSONObject
 
-enum class TunerBackend { QN8035, SIMULATOR }
+enum class TunerBackend {
+    /** FYT head units (UIS7862, UIS8581...): the radio is driven through the com.syu.ms service. */
+    FYT,
+    QN8035,
+    SIMULATOR,
+}
 
 /** What the steering wheel's next/previous buttons do. */
 enum class SteeringWheelAction { PRESETS, SEEK }
 
 data class RadioSettings(
-    val backend: TunerBackend = TunerBackend.QN8035,
+    val backend: TunerBackend = TunerBackend.FYT,
     /** I2C bus the QN8035 sits on, or null to find it automatically. */
     val i2cBus: Int? = null,
     val i2cAddress: Int = 0x10,
@@ -58,6 +63,7 @@ class RadioStore(private val context: Context) {
         context.dataStore.edit { prefs ->
             val s = transform(prefs.toSettings())
             prefs[BACKEND] = s.backend.name
+            prefs[SETTINGS_VERSION] = CURRENT_SETTINGS_VERSION
             prefs[I2C_BUS] = s.i2cBus ?: -1
             prefs[I2C_ADDRESS] = s.i2cAddress
             prefs[CLOCK_HZ] = s.clockHz
@@ -78,7 +84,10 @@ class RadioStore(private val context: Context) {
     private fun Preferences.toSettings(): RadioSettings {
         val defaults = RadioSettings()
         return RadioSettings(
-            backend = enumOrDefault(this[BACKEND], defaults.backend),
+            backend = enumOrDefault(this[BACKEND], defaults.backend).let {
+                // Version 1 only offered QN8035, which does not play on FYT units: move to the new default.
+                if ((this[SETTINGS_VERSION] ?: 1) < 2 && it == TunerBackend.QN8035) defaults.backend else it
+            },
             i2cBus = this[I2C_BUS]?.takeIf { it >= 0 },
             i2cAddress = this[I2C_ADDRESS] ?: defaults.i2cAddress,
             clockHz = this[CLOCK_HZ] ?: defaults.clockHz,
@@ -102,6 +111,8 @@ class RadioStore(private val context: Context) {
         val STEERING_WHEEL = stringPreferencesKey("steering_wheel")
         val PRESETS = stringPreferencesKey("presets")
         val LAST_FREQUENCY = intPreferencesKey("last_frequency")
+        val SETTINGS_VERSION = intPreferencesKey("settings_version")
+        const val CURRENT_SETTINGS_VERSION = 2
 
         inline fun <reified T : Enum<T>> enumOrDefault(name: String?, default: T): T =
             enumValues<T>().firstOrNull { it.name == name } ?: default

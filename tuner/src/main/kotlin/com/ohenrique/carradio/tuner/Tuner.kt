@@ -14,6 +14,12 @@ interface Tuner {
 
     val state: StateFlow<TunerState>
 
+    /**
+     * True when the tuner itself decides whether the radio reaches the speakers (an MCU audio
+     * source switch), so the app must not mute it on Android audio focus changes.
+     */
+    val managesAudioSource: Boolean get() = false
+
     /** Powers the tuner on and tunes to [frequencyKhz] (snapped to the band). */
     suspend fun powerOn(region: Region, frequencyKhz: Int)
 

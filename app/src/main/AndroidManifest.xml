@@ -5,6 +5,14 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- The FYT system service that drives the radio (see fyt/SyuToolkitClient). -->
+    <queries>
+        <package android:name="com.syu.ms" />
+        <intent>
+            <action android:name="com.syu.ms.toolkit" />
+        </intent>
+    </queries>
+
     <application
         android:name=".CarRadioApp"
         android:allowBackup="true"
