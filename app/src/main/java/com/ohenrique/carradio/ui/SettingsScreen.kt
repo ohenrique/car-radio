@@ -39,7 +39,12 @@ import com.ohenrique.carradio.tuner.Region
 import com.ohenrique.carradio.tuner.Sensitivity
 
 @Composable
-fun SettingsScreen(ui: RadioUiState, onBack: () -> Unit, onChange: ((RadioSettings) -> RadioSettings) -> Unit) {
+fun SettingsScreen(
+    ui: RadioUiState,
+    onBack: () -> Unit,
+    onChange: ((RadioSettings) -> RadioSettings) -> Unit,
+    onDiagnostics: () -> Unit,
+) {
     val settings = ui.settings
     Column(
         Modifier
@@ -137,6 +142,10 @@ fun SettingsScreen(ui: RadioUiState, onBack: () -> Unit, onChange: ((RadioSettin
                 ) { value -> onChange { it.copy(steeringWheel = value) } }
             }
 
+            Setting("Diagnóstico", "Mostra como esta central é por dentro, para descobrir como o rádio dela funciona.") {
+                Action("Abrir diagnóstico", onDiagnostics)
+            }
+
             val status = when (ui.tuner.power) {
                 PowerState.ON -> "ligado"
                 PowerState.STARTING -> "ligando"
@@ -182,6 +191,19 @@ private fun <T> Choices(options: List<Pair<T, String>>, selected: T, onSelect: (
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun Action(label: String, onClick: () -> Unit) {
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(12.dp))
+            .background(RadioColors.Surface)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 18.dp, vertical = 12.dp),
+    ) {
+        Text(label, color = RadioColors.Text, fontSize = 16.sp)
     }
 }
 

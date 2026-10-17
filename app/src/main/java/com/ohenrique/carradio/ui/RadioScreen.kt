@@ -71,8 +71,19 @@ import kotlinx.coroutines.launch
 fun RadioScreen(viewModel: RadioViewModel) {
     val ui by viewModel.uiState.collectAsStateWithLifecycle()
     if (ui.showSettings) {
-        BackHandler { viewModel.showSettings(false) }
-        SettingsScreen(ui, onBack = { viewModel.showSettings(false) }, onChange = viewModel::updateSettings)
+        var diagnostics by remember { mutableStateOf(false) }
+        if (diagnostics) {
+            BackHandler { diagnostics = false }
+            DiagnosticsScreen(ui, onBack = { diagnostics = false })
+        } else {
+            BackHandler { viewModel.showSettings(false) }
+            SettingsScreen(
+                ui,
+                onBack = { viewModel.showSettings(false) },
+                onChange = viewModel::updateSettings,
+                onDiagnostics = { diagnostics = true },
+            )
+        }
     } else {
         RadioMain(ui, viewModel)
     }
