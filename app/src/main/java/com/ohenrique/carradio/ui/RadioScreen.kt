@@ -71,8 +71,19 @@ import kotlinx.coroutines.launch
 fun RadioScreen(viewModel: RadioViewModel) {
     val ui by viewModel.uiState.collectAsStateWithLifecycle()
     if (ui.showSettings) {
-        BackHandler { viewModel.showSettings(false) }
-        SettingsScreen(ui, onBack = { viewModel.showSettings(false) }, onChange = viewModel::updateSettings)
+        var diagnostics by remember { mutableStateOf(false) }
+        if (diagnostics) {
+            BackHandler { diagnostics = false }
+            DiagnosticsScreen(ui, onBack = { diagnostics = false })
+        } else {
+            BackHandler { viewModel.showSettings(false) }
+            SettingsScreen(
+                ui,
+                onBack = { viewModel.showSettings(false) },
+                onChange = viewModel::updateSettings,
+                onDiagnostics = { diagnostics = true },
+            )
+        }
     } else {
         RadioMain(ui, viewModel)
     }
@@ -150,8 +161,11 @@ private fun TopBar(
         Indicator("ST", tuner.signal.stereo && tuner.power == PowerState.ON)
         Spacer(Modifier.width(12.dp))
         Indicator("RDS", tuner.rds.programService != null)
-        Spacer(Modifier.width(14.dp))
-        SignalBars(if (tuner.power == PowerState.ON) tuner.signal.bars else 0)
+        // MCU services (NWD, FYT) do not report signal strength.
+        if (ui.tunerReportsSignal) {
+            Spacer(Modifier.width(14.dp))
+            SignalBars(if (tuner.power == PowerState.ON) tuner.signal.bars else 0)
+        }
         if (ui.settings.backend == TunerBackend.SIMULATOR) {
             Spacer(Modifier.width(14.dp))
             Text("SIMULADOR", color = RadioColors.TextFaint, fontSize = 12.sp, letterSpacing = 1.5.sp)

@@ -14,6 +14,21 @@ interface Tuner {
 
     val state: StateFlow<TunerState>
 
+    /**
+     * True when the tuner itself decides whether the radio reaches the speakers (an MCU audio
+     * source switch), so the app must not mute it on Android audio focus changes.
+     */
+    val managesAudioSource: Boolean get() = false
+
+    /** False when the hardware gives no signal strength, so the screen has no signal bars to show. */
+    val reportsSignalStrength: Boolean get() = true
+
+    /**
+     * True when the band plan comes from the head unit (an MCU service reports it), so the app's
+     * region setting does not apply.
+     */
+    val usesHeadUnitBand: Boolean get() = false
+
     /** Powers the tuner on and tunes to [frequencyKhz] (snapped to the band). */
     suspend fun powerOn(region: Region, frequencyKhz: Int)
 
@@ -30,6 +45,12 @@ interface Tuner {
     suspend fun seek(direction: SeekDirection, wrap: Boolean = true): FoundStation?
 
     suspend fun setMuted(muted: Boolean)
+
+    /**
+     * Brings the radio back to the speakers when the head unit switched to another source, as a
+     * stock radio does when it is opened. Leaves a mute the user chose alone.
+     */
+    suspend fun reclaimSource() {}
 
     suspend fun setForceMono(forceMono: Boolean)
 
@@ -93,4 +114,6 @@ data class TunerState(
     val sensitivity: Sensitivity = Sensitivity.DX,
     val rdsEnabled: Boolean = true,
     val error: String? = null,
+    /** True when [error] means the connection to the radio service dropped; the app then reconnects. */
+    val connectionLost: Boolean = false,
 )

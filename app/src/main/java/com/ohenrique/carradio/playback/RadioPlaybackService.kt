@@ -8,8 +8,6 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.media.AudioAttributes
-import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.IBinder
 import android.support.v4.media.MediaMetadataCompat
@@ -25,10 +23,13 @@ import com.ohenrique.carradio.R
 import com.ohenrique.carradio.data.SteeringWheelAction
 import com.ohenrique.carradio.tuner.PowerState
 import com.ohenrique.carradio.tuner.SeekDirection
+import com.ohenrique.carradio.tuner.Tuner
 import com.ohenrique.carradio.tuner.TunerState
 import com.ohenrique.carradio.tuner.formatMhz
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import androidx.media.app.NotificationCompat as MediaNotificationCompat
 
@@ -40,14 +41,12 @@ class RadioPlaybackService : Service() {
 
     private val scope = MainScope()
     private val radio get() = (application as CarRadioApp).radio
+    private val focus get() = (application as CarRadioApp).audioFocus
     private lateinit var session: MediaSessionCompat
-    private lateinit var audioManager: AudioManager
-    private var focusRequest: AudioFocusRequest? = null
     private var mutedByFocusLoss = false
 
     override fun onCreate() {
         super.onCreate()
-        audioManager = getSystemService(AudioManager::class.java)
         createChannel()
         session = MediaSessionCompat(this, "CarRadio").apply {
             setCallback(SessionCallback())
@@ -60,12 +59,16 @@ class RadioPlaybackService : Service() {
             buildNotification(radio.state.value),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
         )
-        requestFocus()
         scope.launch {
             radio.state.collect { state ->
                 updateSession(state)
                 getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification(state))
             }
+        }
+        scope.launch {
+            combine(radio.tuner, radio.state) { tuner, state -> wantsFocus(tuner, state) }
+                .distinctUntilChanged()
+                .collect { wanted -> if (wanted) requestFocus() else focus.abandon() }
         }
     }
 
@@ -77,7 +80,7 @@ class RadioPlaybackService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        focusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+        focus.abandon()
         session.release()
         scope.cancel()
         super.onDestroy()
@@ -85,13 +88,17 @@ class RadioPlaybackService : Service() {
 
     private inner class SessionCallback : MediaSessionCompat.Callback() {
         override fun onPlay() {
-            requestFocus()
+            if (wantsFocus()) requestFocus()
             radio.setMuted(false)
         }
 
         override fun onPause() = radio.setMuted(true)
 
-        override fun onStop() = radio.setMuted(true)
+        override fun onStop() {
+            // NWD firmware sends a stop key while it switches the MCU to the radio; muting on it
+            // would silence the radio right after the app claimed the speakers.
+            if (!radio.tuner.value.managesAudioSource) radio.setMuted(true)
+        }
 
         override fun onSkipToNext() = skip(+1)
 
@@ -109,21 +116,20 @@ class RadioPlaybackService : Service() {
         }
     }
 
-    private fun requestFocus() {
-        val request = focusRequest ?: AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build(),
-            )
-            .setOnAudioFocusChangeListener(::onFocusChange)
-            .build()
-            .also { focusRequest = it }
-        audioManager.requestAudioFocus(request)
-    }
+    /**
+     * Android's audio focus is only for a tuner that is on and whose sound Android routes. Where the
+     * MCU switches the speakers between sources (FYT, NWD) the focus means nothing, and NWD's system
+     * even stops an app that holds it when the MCU leaves Android.
+     */
+    private fun wantsFocus(tuner: Tuner = radio.tuner.value, state: TunerState = radio.state.value): Boolean =
+        state.power == PowerState.ON && !tuner.managesAudioSource
+
+    private fun requestFocus() = focus.request(::onFocusChange)
 
     private fun onFocusChange(change: Int) {
+        // Where the MCU switches the speakers between sources by itself, muting here could silence
+        // the app that just took over.
+        if (radio.tuner.value.managesAudioSource) return
         when (change) {
             AudioManager.AUDIOFOCUS_GAIN -> if (mutedByFocusLoss) {
                 mutedByFocusLoss = false

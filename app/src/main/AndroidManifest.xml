@@ -1,9 +1,30 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Only for the diagnostics screen, which lists the head unit vendor's apps. Not on Play. -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <!-- The head unit services that drive the radio: FYT's com.syu.ms (see fyt/SyuToolkitClient),
+         and NWD's radio service, MCU kernel, stock radio and settings service (see nwd/NwdServiceClient). -->
+    <queries>
+        <package android:name="com.syu.ms" />
+        <package android:name="com.nwd.radio.service" />
+        <package android:name="com.nwd.kernel" />
+        <package android:name="com.nwd.radio" />
+        <package android:name="com.nwd.setting.service" />
+        <intent>
+            <action android:name="com.syu.ms.toolkit" />
+        </intent>
+        <intent>
+            <action android:name="com.nwd.radio.service.ACTION_RADIO_SERVICE" />
+        </intent>
+    </queries>
 
     <application
         android:name=".CarRadioApp"
