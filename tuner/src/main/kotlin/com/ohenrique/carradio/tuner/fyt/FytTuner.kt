@@ -59,6 +59,10 @@ class FytTuner(
 
     override val managesAudioSource = true
 
+    override val reportsSignalStrength = false
+
+    override val usesHeadUnitBand = true
+
     private val _state = MutableStateFlow(TunerState())
     override val state: StateFlow<TunerState> = _state.asStateFlow()
 
@@ -98,12 +102,12 @@ class FytTuner(
 
     override suspend fun powerOn(region: Region, frequencyKhz: Int) {
         if (_state.value.power == PowerState.ON) return
-        _state.update { it.copy(power = PowerState.STARTING, region = region, error = null) }
+        _state.update { it.copy(power = PowerState.STARTING, region = region, error = null, connectionLost = false) }
         try {
             val toolkit = withTimeout(timing.connectMs) { connect() }
             this.toolkit = toolkit
             toolkit.listener = ::onUpdate
-            toolkit.onDisconnected = { fail(CONNECTION_LOST) }
+            toolkit.onDisconnected = { fail(CONNECTION_LOST, connectionLost = true) }
             main = toolkit.module(Syu.MODULE_MAIN)
             sound = toolkit.module(Syu.MODULE_SOUND)
             radio = toolkit.module(Syu.MODULE_RADIO)
@@ -459,7 +463,7 @@ class FytTuner(
 
     private fun toMcu(frequencyKhz: Int): Int = if (fmInKhz == true) frequencyKhz else frequencyKhz / 10
 
-    private fun fail(message: String) {
+    private fun fail(message: String, connectionLost: Boolean = false) {
         val tk = toolkit
         toolkit = null
         main = null
@@ -468,7 +472,9 @@ class FytTuner(
         tk?.listener = null
         tk?.onDisconnected = null
         runCatching { tk?.close() }
-        _state.update { it.copy(power = PowerState.ERROR, activity = TunerActivity.IDLE, error = message) }
+        _state.update {
+            it.copy(power = PowerState.ERROR, activity = TunerActivity.IDLE, error = message, connectionLost = connectionLost)
+        }
     }
 
     companion object {
@@ -494,12 +500,6 @@ class FytTuner(
         )
 
         /** The [Region] whose grid matches the band the MCU reports. */
-        fun closestRegion(minKhz: Int, maxKhz: Int, stepKhz: Int?): Region = when {
-            minKhz < 80_000 && maxKhz <= 95_000 -> Region.JAPAN
-            minKhz < 80_000 -> Region.BRAZIL
-            stepKhz == 200 -> Region.USA
-            stepKhz == 50 -> Region.EUROPE
-            else -> Region.AMERICAS
-        }
+        fun closestRegion(minKhz: Int, maxKhz: Int, stepKhz: Int?): Region = Region.closest(minKhz, maxKhz, stepKhz)
     }
 }

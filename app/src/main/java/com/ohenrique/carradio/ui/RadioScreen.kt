@@ -161,8 +161,8 @@ private fun TopBar(
         Indicator("ST", tuner.signal.stereo && tuner.power == PowerState.ON)
         Spacer(Modifier.width(12.dp))
         Indicator("RDS", tuner.rds.programService != null)
-        // FYT units do not report signal strength.
-        if (ui.settings.backend != TunerBackend.FYT) {
+        // MCU services (NWD, FYT) do not report signal strength.
+        if (ui.tunerReportsSignal) {
             Spacer(Modifier.width(14.dp))
             SignalBars(if (tuner.power == PowerState.ON) tuner.signal.bars else 0)
         }

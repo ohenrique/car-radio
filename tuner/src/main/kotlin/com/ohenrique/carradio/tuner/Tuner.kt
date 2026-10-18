@@ -20,6 +20,15 @@ interface Tuner {
      */
     val managesAudioSource: Boolean get() = false
 
+    /** False when the hardware gives no signal strength, so the screen has no signal bars to show. */
+    val reportsSignalStrength: Boolean get() = true
+
+    /**
+     * True when the band plan comes from the head unit (an MCU service reports it), so the app's
+     * region setting does not apply.
+     */
+    val usesHeadUnitBand: Boolean get() = false
+
     /** Powers the tuner on and tunes to [frequencyKhz] (snapped to the band). */
     suspend fun powerOn(region: Region, frequencyKhz: Int)
 
@@ -105,4 +114,6 @@ data class TunerState(
     val sensitivity: Sensitivity = Sensitivity.DX,
     val rdsEnabled: Boolean = true,
     val error: String? = null,
+    /** True when [error] means the connection to the radio service dropped; the app then reconnects. */
+    val connectionLost: Boolean = false,
 )

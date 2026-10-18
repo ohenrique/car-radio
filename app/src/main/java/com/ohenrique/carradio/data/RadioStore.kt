@@ -16,6 +16,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 enum class TunerBackend {
+    /** Finds the head unit's radio when the tuner starts: NWD when its radio service is installed, else FYT. */
+    AUTO,
+    /** NWD head units (K4811, K2501...): the radio is driven through the vendor's com.nwd.radio.service. */
+    NWD,
     /** FYT head units (UIS7862, UIS8581...): the radio is driven through the com.syu.ms service. */
     FYT,
     QN8035,
@@ -26,7 +30,7 @@ enum class TunerBackend {
 enum class SteeringWheelAction { PRESETS, SEEK }
 
 data class RadioSettings(
-    val backend: TunerBackend = TunerBackend.FYT,
+    val backend: TunerBackend = TunerBackend.AUTO,
     /** I2C bus the QN8035 sits on, or null to find it automatically. */
     val i2cBus: Int? = null,
     val i2cAddress: Int = 0x10,
@@ -85,8 +89,10 @@ class RadioStore(private val context: Context) {
         val defaults = RadioSettings()
         return RadioSettings(
             backend = enumOrDefault(this[BACKEND], defaults.backend).let {
-                // Version 1 only offered QN8035, which does not play on FYT units: move to the new default.
-                if ((this[SETTINGS_VERSION] ?: 1) < 2 && it == TunerBackend.QN8035) defaults.backend else it
+                // Before version 3 the app took every unit for FYT (or QN8035 in version 1), and
+                // neither plays on NWD units like the Link8wf: move them to automatic detection.
+                val stale = it == TunerBackend.FYT || it == TunerBackend.QN8035
+                if ((this[SETTINGS_VERSION] ?: 1) < 3 && stale) defaults.backend else it
             },
             i2cBus = this[I2C_BUS]?.takeIf { it >= 0 },
             i2cAddress = this[I2C_ADDRESS] ?: defaults.i2cAddress,
@@ -112,7 +118,7 @@ class RadioStore(private val context: Context) {
         val PRESETS = stringPreferencesKey("presets")
         val LAST_FREQUENCY = intPreferencesKey("last_frequency")
         val SETTINGS_VERSION = intPreferencesKey("settings_version")
-        const val CURRENT_SETTINGS_VERSION = 2
+        const val CURRENT_SETTINGS_VERSION = 3
 
         inline fun <reified T : Enum<T>> enumOrDefault(name: String?, default: T): T =
             enumValues<T>().firstOrNull { it.name == name } ?: default

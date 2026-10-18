@@ -372,6 +372,31 @@ class FytTunerTest {
     }
 
     @Test
+    fun `losing the service flags the lost connection`() = runTest {
+        var mcu = FakeMcu()
+        val tuner = FytTuner({ mcu })
+        tuner.powerOn(Region.BRAZIL, 87_900)
+        assertFalse(tuner.state.value.connectionLost)
+
+        mcu.die()
+        assertTrue(tuner.state.value.connectionLost)
+
+        mcu = FakeMcu()
+        tuner.powerOn(Region.BRAZIL, 87_900)
+        assertEquals(PowerState.ON, tuner.state.value.power)
+        assertFalse(tuner.state.value.connectionLost)
+    }
+
+    @Test
+    fun `reports its capabilities`() {
+        val tuner = FytTuner({ FakeMcu() })
+
+        assertTrue(tuner.managesAudioSource)
+        assertFalse(tuner.reportsSignalStrength)
+        assertTrue(tuner.usesHeadUnitBand)
+    }
+
+    @Test
     fun `tuning takes the speakers back from another source`() = runTest {
         val mcu = FakeMcu()
         val tuner = FytTuner({ mcu })

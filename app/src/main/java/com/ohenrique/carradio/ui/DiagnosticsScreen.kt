@@ -38,6 +38,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.ohenrique.carradio.CarRadioApp
 import com.ohenrique.carradio.diag.Diagnostics
 import kotlinx.coroutines.launch
 
@@ -53,7 +54,8 @@ fun DiagnosticsScreen(ui: RadioUiState, onBack: () -> Unit) {
         if (collecting) return
         collecting = true
         scope.launch {
-            report = runCatching { Diagnostics.collect(context.applicationContext, ui.tunerName, ui.tuner) }
+            val app = context.applicationContext as CarRadioApp
+            report = runCatching { Diagnostics.collect(app, ui.tunerName, ui.tuner, app.radioLog.lines()) }
                 .getOrElse { "erro ao coletar: ${it.message ?: it}" }
             collecting = false
         }

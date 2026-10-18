@@ -22,13 +22,19 @@ import java.util.concurrent.TimeUnit
 /**
  * Collects what identifies the head unit's platform and how its radio is reached, as plain text
  * the user can photograph or share: system properties, vendor packages and their services, known
- * framework classes, Binder services, device nodes, and a passive check of com.syu.ms.
+ * framework classes, Binder services, device nodes, passive checks of com.nwd.radio.service and
+ * com.syu.ms, and what the tuner traced in real use ([radioLog]).
  *
  * Nothing here changes the head unit: no command is sent to any service.
  */
 object Diagnostics {
 
-    suspend fun collect(context: Context, tunerName: String, tuner: TunerState): String = withContext(Dispatchers.IO) {
+    suspend fun collect(
+        context: Context,
+        tunerName: String,
+        tuner: TunerState,
+        radioLog: List<String>,
+    ): String = withContext(Dispatchers.IO) {
         val report = StringBuilder()
         fun section(title: String, block: () -> List<String>) {
             report.append("== ").append(title).append(" ==\n")
@@ -48,6 +54,9 @@ object Diagnostics {
         section("Aparelho") { device() }
         section("Propriedades") { properties() }
         section("Recursos de rádio") { features(context) + classes() }
+        val nwd = runCatching { NwdProbe.collect(context) }.getOrElse { listOf("erro: ${it.message ?: it}") }
+        section("Rádio NWD (com.nwd.radio.service)") { nwd }
+        section("Registro do rádio NWD") { radioLog.ifEmpty { listOf("vazio: o sintonizador NWD ainda não foi usado desde que o app abriu") } }
         val fyt = runCatching { fytProbe(context) }.getOrElse { listOf("erro: ${it.message ?: it}") }
         section("Serviço FYT (com.syu.ms)") { fyt }
         section("Pacotes do fabricante") { packages(context) }
@@ -86,9 +95,9 @@ object Diagnostics {
         return RADIO_FEATURES.map { "recurso $it: ${if (pm.hasSystemFeature(it)) "sim" else "não"}" }
     }
 
-    /** Framework classes that only exist on some platforms. */
+    /** Framework classes that only exist on some platforms. Looked up without running their static code. */
     private fun classes(): List<String> = PLATFORM_CLASSES.map { name ->
-        val present = runCatching { Class.forName(name) }.isSuccess
+        val present = runCatching { Class.forName(name, false, Diagnostics::class.java.classLoader) }.isSuccess
         "classe $name: ${if (present) "presente" else "ausente"}"
     }
 
@@ -225,7 +234,7 @@ object Diagnostics {
     }
 
     /** Runs a system tool and returns its output, or null when it fails or hangs. */
-    private fun exec(vararg command: String): String? = runCatching {
+    internal fun exec(vararg command: String): String? = runCatching {
         val process = ProcessBuilder(*command).redirectErrorStream(true).start()
         val output = StringBuilder()
         val reader = Thread {
@@ -275,10 +284,11 @@ object Diagnostics {
 
     private val RADIO_FEATURES = listOf("android.hardware.broadcastradio", "android.hardware.type.automotive")
 
-    /** In the framework of TopWay (TWUtil) and Microntek MTC units only. */
+    /** In the framework of TopWay (TWUtil), Microntek MTC and NWD units only. */
     private val PLATFORM_CLASSES = listOf(
         "android.tw.john.TWUtil",
         "android.microntek.CarManager",
         "android.microntek.mtcser.BTServiceInf",
+        "com.nwd.app.NwdFmManager",
     )
 }

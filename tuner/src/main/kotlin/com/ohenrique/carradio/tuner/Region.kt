@@ -34,6 +34,17 @@ enum class Region(
     }
 
     operator fun contains(frequencyKhz: Int): Boolean = frequencyKhz in minKhz..maxKhz
+
+    companion object {
+        /** The region whose grid matches a band a head unit reports, in kHz. */
+        fun closest(minKhz: Int, maxKhz: Int, stepKhz: Int?): Region = when {
+            minKhz < 80_000 && maxKhz <= 95_000 -> JAPAN
+            minKhz < 80_000 -> BRAZIL
+            stepKhz == 200 -> USA
+            stepKhz == 50 -> EUROPE
+            else -> AMERICAS
+        }
+    }
 }
 
 /** "98.5" style label for a frequency in kHz. 50 kHz steps get a second decimal. */

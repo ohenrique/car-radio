@@ -18,6 +18,10 @@ import kotlinx.coroutines.flow.stateIn
 data class RadioUiState(
     val tuner: TunerState = TunerState(),
     val tunerName: String = "",
+    /** False when the tuner gives no signal strength, so there are no signal bars to show. */
+    val tunerReportsSignal: Boolean = true,
+    /** True when the band comes from the head unit, so the region setting does not apply. */
+    val tunerUsesHeadUnitBand: Boolean = false,
     val presets: List<Preset?> = emptyList(),
     val presetPage: Int = 0,
     val settings: RadioSettings = RadioSettings(),
@@ -35,15 +39,17 @@ class RadioViewModel(application: Application) : AndroidViewModel(application) {
     private val showSettings = MutableStateFlow(false)
 
     val uiState: StateFlow<RadioUiState> = combine(
-        combine(radio.state, radio.tuner) { state, tuner -> state to tuner.name },
+        combine(radio.state, radio.tuner) { state, tuner -> state to tuner },
         radio.presets,
         radio.settings,
         radio.scanning,
         combine(presetPage, showSettings) { page, settings -> page to settings },
-    ) { (state, tunerName), presets, settings, scanning, (page, showSettings) ->
+    ) { (state, tuner), presets, settings, scanning, (page, showSettings) ->
         RadioUiState(
             tuner = state,
-            tunerName = tunerName,
+            tunerName = tuner.name,
+            tunerReportsSignal = tuner.reportsSignalStrength,
+            tunerUsesHeadUnitBand = tuner.usesHeadUnitBand,
             presets = presets,
             presetPage = page,
             settings = settings ?: RadioSettings(),

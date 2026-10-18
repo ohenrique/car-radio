@@ -11,8 +11,11 @@ import com.ohenrique.carradio.tuner.Sensitivity
 import com.ohenrique.carradio.tuner.Tuner
 import com.ohenrique.carradio.tuner.TunerActivity
 import com.ohenrique.carradio.tuner.TunerState
+import com.ohenrique.carradio.tuner.UnavailableTuner
 import com.ohenrique.carradio.tuner.fyt.FytTuner
 import com.ohenrique.carradio.tuner.fyt.SyuToolkit
+import com.ohenrique.carradio.tuner.nwd.NwdService
+import com.ohenrique.carradio.tuner.nwd.NwdTuner
 import com.ohenrique.carradio.tuner.qn8035.Qn8035Config
 import com.ohenrique.carradio.tuner.qn8035.Qn8035Tuner
 import com.ohenrique.carradio.tuner.scanBand
@@ -43,12 +46,21 @@ import kotlinx.coroutines.sync.withLock
 /**
  * The one place that owns the tuner. The screen and the media session (steering wheel keys,
  * notification) both drive the radio through it, so they always agree on what is playing.
+ *
+ * @param detectBackend the head unit's own radio, for [TunerBackend.AUTO]: NWD, FYT, or null for none.
+ * @param releaseAudioFocus gives up Android's audio focus at once, before a tuner that manages the
+ *   head unit's audio source starts.
+ * @param trace the tuners' decisions, for the diagnostics screen.
  */
 @OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
 class RadioController(
     private val store: RadioStore,
     private val scope: CoroutineScope,
     private val connectFyt: suspend () -> SyuToolkit,
+    private val connectNwd: suspend () -> NwdService,
+    private val detectBackend: () -> TunerBackend?,
+    private val releaseAudioFocus: () -> Unit,
+    private val trace: (String) -> Unit,
 ) {
     private val _tuner = MutableStateFlow<Tuner>(SimulatedTuner())
     val tuner: StateFlow<Tuner> = _tuner.asStateFlow()
@@ -92,28 +104,32 @@ class RadioController(
             }
             .launchIn(scope)
 
-        // com.syu.ms can restart (a system update, a crash); bind it again when it does.
-        state.filter { it.power == PowerState.ERROR && it.error == FytTuner.CONNECTION_LOST }
+        // The head unit's radio service can restart (a system update, a crash); bind it again when
+        // it does. Only a radio the user was hearing takes the speakers back: a restart while
+        // another source plays must not switch the head unit to the radio.
+        state.filter { it.power == PowerState.ERROR && it.connectionLost }
             .onEach {
+                trace("Conexão com o serviço de rádio perdida; religando em $RECONNECT_DELAY_MS ms")
                 delay(RECONNECT_DELAY_MS)
-                start()
+                start(takeSpeakers = !it.muted)
             }
             .launchIn(scope)
     }
 
     /**
      * Powers the tuner on with the saved settings, unless it is already running. Opening the app
-     * also takes the speakers back when the head unit had switched to another source.
+     * also takes the speakers back when the head unit had switched to another source; with
+     * [takeSpeakers] false, as on an automatic reconnect, the source is left alone.
      */
-    fun start() {
+    fun start(takeSpeakers: Boolean = true) {
         scope.launch {
             lifecycle.withLock {
                 val settings = store.settings.first()
                 if (state.value.power == PowerState.ON && settings == activeSettings) {
-                    runCatching { _tuner.value.reclaimSource() }
+                    if (takeSpeakers) runCatching { _tuner.value.reclaimSource() }
                     return@withLock
                 }
-                restart(settings)
+                restart(settings, takeSpeakers)
             }
         }
     }
@@ -202,7 +218,7 @@ class RadioController(
         scope.launch { runCatching { _tuner.value.setMuted(muted) } }
     }
 
-    /** Flips what the tuner is actually using, which on FYT units may differ from the saved setting. */
+    /** Flips what the tuner is actually using, which on head units with an MCU may differ from the saved setting. */
     fun toggleSensitivity() {
         val next = if (state.value.sensitivity == Sensitivity.DX) Sensitivity.LOCAL else Sensitivity.DX
         updateSettings { it.copy(sensitivity = next) }
@@ -240,11 +256,14 @@ class RadioController(
         }
     }
 
-    private suspend fun restart(settings: RadioSettings) {
+    private suspend fun restart(settings: RadioSettings, takeSpeakers: Boolean = true) {
         operation?.cancel()
         pendingKhz = null
         _tuner.value.powerOff()
-        val tuner = createTuner(settings)
+        val tuner = createTuner(settings, takeSpeakers)
+        // NWD's system stops an app that still holds the focus when the MCU switches away from
+        // Android, so a focus taken for a previous tuner goes before this one can switch it.
+        if (tuner.managesAudioSource) releaseAudioFocus()
         _tuner.value = tuner
         tuner.setSensitivity(settings.sensitivity)
         tuner.setForceMono(settings.forceMono)
@@ -258,7 +277,18 @@ class RadioController(
         old.backend != new.backend || old.i2cBus != new.i2cBus || old.i2cAddress != new.i2cAddress ||
             old.clockHz != new.clockHz || old.region != new.region
 
-    private fun createTuner(settings: RadioSettings): Tuner = when (settings.backend) {
+    private fun createTuner(settings: RadioSettings, takeSpeakers: Boolean): Tuner = when (settings.backend) {
+        // Detected again on every start, so a reconnect finds the radio the unit has now.
+        TunerBackend.AUTO -> {
+            val found = detectBackend()?.takeIf { it == TunerBackend.NWD || it == TunerBackend.FYT }
+            trace("Sintonizador automático: ${found ?: "nenhum rádio reconhecido"}")
+            if (found != null) {
+                createTuner(settings.copy(backend = found), takeSpeakers)
+            } else {
+                UnavailableTuner("Nenhum rádio reconhecido", NO_RADIO_FOUND)
+            }
+        }
+        TunerBackend.NWD -> NwdTuner(connectNwd, takeSpeakers = takeSpeakers, trace = trace)
         TunerBackend.FYT -> FytTuner(connectFyt)
         TunerBackend.SIMULATOR -> SimulatedTuner()
         TunerBackend.QN8035 -> Qn8035Tuner(
@@ -272,5 +302,8 @@ class RadioController(
 
     private companion object {
         const val RECONNECT_DELAY_MS = 2_000L
+
+        const val NO_RADIO_FOUND = "Não reconheci o rádio desta central: não há o serviço NWD (com.nwd.radio.service) " +
+            "nem o FYT (com.syu.ms). Escolha o sintonizador nos ajustes ou veja o Diagnóstico."
     }
 }
