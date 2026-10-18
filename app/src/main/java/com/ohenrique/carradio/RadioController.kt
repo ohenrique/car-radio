@@ -81,6 +81,7 @@ class RadioController(
     private val lifecycle = Mutex()
     private var operation: Job? = null
     private var activeSettings: RadioSettings? = null
+    private var reconnecting: Job? = null
 
     /** Frequency of a tune that was asked for but may not have reached the tuner yet. */
     private var pendingKhz: Int? = null
@@ -105,15 +106,42 @@ class RadioController(
             .launchIn(scope)
 
         // The head unit's radio service can restart (a system update, a crash); bind it again when
-        // it does. Only a radio the user was hearing takes the speakers back: a restart while
-        // another source plays must not switch the head unit to the radio.
+        // it does, and keep trying while it is not back. Only a radio the user was hearing takes
+        // the speakers back: a restart while another source plays must not switch the head unit
+        // to the radio.
         state.filter { it.power == PowerState.ERROR && it.connectionLost }
-            .onEach {
-                trace("Conexão com o serviço de rádio perdida; religando em $RECONNECT_DELAY_MS ms")
-                delay(RECONNECT_DELAY_MS)
-                start(takeSpeakers = !it.muted)
+            .onEach { lost ->
+                // A loss while reconnecting is that reconnect's to retry.
+                if (reconnecting?.isActive == true) return@onEach
+                // Read before the dead tuner is powered off, which forgets it.
+                val unitMuteHeld = (_tuner.value as? NwdTuner)?.holdsUnitMute == true
+                reconnecting = scope.launch { reconnect(takeSpeakers = !lost.muted, unitMuteHeld) }
             }
             .launchIn(scope)
+    }
+
+    /**
+     * Binds the radio again after its connection was lost: [RECONNECT_DELAY_MS] later, then twice
+     * as long after every attempt that failed, up to [MAX_RECONNECT_DELAY_MS], until the radio is
+     * back or the user starts, stops or reconfigures it. Every attempt uses [takeSpeakers] and
+     * [unitMuteHeld] as they were when the connection was lost: a tuner that failed to start
+     * knows neither.
+     */
+    private suspend fun reconnect(takeSpeakers: Boolean, unitMuteHeld: Boolean) {
+        var wait = RECONNECT_DELAY_MS
+        trace("Conexão com o serviço de rádio perdida; religando em $wait ms")
+        while (true) {
+            delay(wait)
+            val done = lifecycle.withLock {
+                // Started, stopped or reconfigured meanwhile.
+                if (_tuner.value.state.value.power != PowerState.ERROR) return@withLock true
+                restart(store.settings.first(), takeSpeakers, unitMuteHeld)
+                _tuner.value.state.value.power == PowerState.ON
+            }
+            if (done) return
+            wait = (wait * 2).coerceAtMost(MAX_RECONNECT_DELAY_MS)
+            trace("O rádio não voltou; nova tentativa em $wait ms")
+        }
     }
 
     /**
@@ -122,6 +150,7 @@ class RadioController(
      * [takeSpeakers] false, as on an automatic reconnect, the source is left alone.
      */
     fun start(takeSpeakers: Boolean = true) {
+        reconnecting?.cancel()
         scope.launch {
             lifecycle.withLock {
                 val settings = store.settings.first()
@@ -135,6 +164,7 @@ class RadioController(
     }
 
     fun stop() {
+        reconnecting?.cancel()
         scope.launch {
             lifecycle.withLock {
                 operation?.cancel()
@@ -159,6 +189,7 @@ class RadioController(
                     }
                     activeSettings = settings
                 } else {
+                    reconnecting?.cancel()
                     restart(settings)
                 }
             }
@@ -251,16 +282,27 @@ class RadioController(
         operation = scope.launch {
             previous?.cancel()
             previous?.join()
-            if (state.value.power != PowerState.ON) return@launch
+            if (state.value.power != PowerState.ON) {
+                // Dropped: the next step starts from what the dial shows, not from this tap.
+                pendingKhz = null
+                return@launch
+            }
             runCatching { block(_tuner.value) }
         }
     }
 
-    private suspend fun restart(settings: RadioSettings, takeSpeakers: Boolean = true) {
+    /**
+     * @param unitMuteHeld the head unit is muted by this app through a tuner that lost its
+     *   connection, so the new one must lift that mute when another source plays.
+     */
+    private suspend fun restart(settings: RadioSettings, takeSpeakers: Boolean = true, unitMuteHeld: Boolean = false) {
         operation?.cancel()
         pendingKhz = null
+        // A tuner that lost its service cannot lift its mute when powered off, and then forgets it.
+        val lost = (_tuner.value as? NwdTuner)?.takeIf { it.state.value.power == PowerState.ERROR }
+        val muteHeld = unitMuteHeld || lost?.holdsUnitMute == true
         _tuner.value.powerOff()
-        val tuner = createTuner(settings, takeSpeakers)
+        val tuner = createTuner(settings, takeSpeakers, muteHeld)
         // NWD's system stops an app that still holds the focus when the MCU switches away from
         // Android, so a focus taken for a previous tuner goes before this one can switch it.
         if (tuner.managesAudioSource) releaseAudioFocus()
@@ -277,18 +319,18 @@ class RadioController(
         old.backend != new.backend || old.i2cBus != new.i2cBus || old.i2cAddress != new.i2cAddress ||
             old.clockHz != new.clockHz || old.region != new.region
 
-    private fun createTuner(settings: RadioSettings, takeSpeakers: Boolean): Tuner = when (settings.backend) {
+    private fun createTuner(settings: RadioSettings, takeSpeakers: Boolean, unitMuteHeld: Boolean): Tuner = when (settings.backend) {
         // Detected again on every start, so a reconnect finds the radio the unit has now.
         TunerBackend.AUTO -> {
             val found = detectBackend()?.takeIf { it == TunerBackend.NWD || it == TunerBackend.FYT }
             trace("Sintonizador automático: ${found ?: "nenhum rádio reconhecido"}")
             if (found != null) {
-                createTuner(settings.copy(backend = found), takeSpeakers)
+                createTuner(settings.copy(backend = found), takeSpeakers, unitMuteHeld)
             } else {
                 UnavailableTuner("Nenhum rádio reconhecido", NO_RADIO_FOUND)
             }
         }
-        TunerBackend.NWD -> NwdTuner(connectNwd, takeSpeakers = takeSpeakers, trace = trace)
+        TunerBackend.NWD -> NwdTuner(connectNwd, takeSpeakers = takeSpeakers, inheritedUnitMute = unitMuteHeld, trace = trace)
         TunerBackend.FYT -> FytTuner(connectFyt)
         TunerBackend.SIMULATOR -> SimulatedTuner()
         TunerBackend.QN8035 -> Qn8035Tuner(
@@ -302,6 +344,7 @@ class RadioController(
 
     private companion object {
         const val RECONNECT_DELAY_MS = 2_000L
+        const val MAX_RECONNECT_DELAY_MS = 60_000L
 
         const val NO_RADIO_FOUND = "Não reconheci o rádio desta central: não há o serviço NWD (com.nwd.radio.service) " +
             "nem o FYT (com.syu.ms). Escolha o sintonizador nos ajustes ou veja o Diagnóstico."

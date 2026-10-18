@@ -1,6 +1,7 @@
 package com.ohenrique.carradio.tuner.nwd
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -14,7 +15,8 @@ import kotlinx.coroutines.runBlocking
  * Everything happens on the caller's thread, right away, unless [scope] is given: then the unit
  * answers in the background like the real one, a station search moving one channel per
  * [seekStepMs], a tune landing after [tuneDelayMs] and a claimed source switching after
- * [claimDelayMs]. Set [clock] to the test's virtual time for anything time based.
+ * [claimDelayMs]. With [inOrder] too, tunes and seeks run one after another, as on an MCU behind a
+ * serial line. Set [clock] to the test's virtual time for anything time based.
  */
 internal class FakeNwd(
     var type: Int = Nwd.RadioType.MCU,
@@ -75,6 +77,8 @@ internal class FakeNwd(
     val refusedCalls: Set<String> = emptySet(),
     val scope: CoroutineScope? = null,
     val seekStepMs: Long = 20,
+    /** Tunes and seeks wait for the one before to finish (a seek sent while a tune lands starts after it). */
+    val inOrder: Boolean = false,
 ) : NwdService {
 
     data class Command(val name: String, val args: List<Any?>, val atMs: Long)
@@ -97,6 +101,12 @@ internal class FakeNwd(
 
     private var readyAt = 0L
     private var lastBandChangeAt: Long? = null
+
+    private val queue = if (inOrder && scope != null) {
+        Channel<suspend () -> Unit>(Channel.UNLIMITED).also { queue -> scope.launch { for (job in queue) job() } }
+    } else {
+        null
+    }
 
     override var listener: ((NwdEvent) -> Unit)? = null
     override var onDisconnected: (() -> Unit)? = null
@@ -136,7 +146,7 @@ internal class FakeNwd(
                 ignoresTunes > 0 -> ignoresTunes--
                 clock() < readyAt -> Unit
                 tunesNeedSource && source != Nwd.Source.RADIO -> Unit
-                else -> later(tuneDelayMs) { applyTune(frequency, band, presetIndex) }
+                else -> onRadio(tuneDelayMs) { applyTune(frequency, band, presetIndex) }
             }
         }
 
@@ -249,6 +259,11 @@ internal class FakeNwd(
         notice(NwdEvent.StereoPilotChanged(stereo))
     }
 
+    /** notifyRadioScanState: non-zero while the service scans. */
+    fun pushScanState(state: Int) {
+        notice(NwdEvent.ScanStateChanged(state))
+    }
+
     fun pushRadioPoint(points: List<NwdRadioPoint?>) {
         this.points = points
         notice(NwdEvent.RadioPointChanged(points))
@@ -297,7 +312,7 @@ internal class FakeNwd(
     private fun move(call: SeekCall, argument: Boolean) {
         if (call == inertCall || !Nwd.Band.isFm(band)) return
         val delta = if (argument == trueMeansUp) 1 else -1
-        if (call == stationSeekCall) sweep(delta) else later(seekStepMs) { moveTo(next(frequency, delta)) }
+        if (call == stationSeekCall) sweep(delta) else onRadio(seekStepMs) { moveTo(next(frequency, delta)) }
     }
 
     private fun sweep(delta: Int) {
@@ -320,7 +335,11 @@ internal class FakeNwd(
             seeking = false
             if (reportsBusy) notice(NwdEvent.StateChanged(Nwd.State.NORMAL))
         }
-        if (scope != null) scope.launch { run() } else runBlocking { run() }
+        when {
+            queue != null -> queue.trySend(run)
+            scope != null -> scope.launch { run() }
+            else -> runBlocking { run() }
+        }
     }
 
     private fun switchBand(band: Int) {
@@ -340,6 +359,18 @@ internal class FakeNwd(
     private fun moveTo(f: Int) {
         frequency = f
         notice(NwdEvent.FrequencyChanged(current()))
+    }
+
+    /** A tune or a one channel step: behind the ones before it when [inOrder]. */
+    private fun onRadio(delayMs: Long, action: () -> Unit) {
+        if (queue == null) {
+            later(delayMs, action)
+        } else {
+            queue.trySend {
+                delay(delayMs)
+                action()
+            }
+        }
     }
 
     private fun later(delayMs: Long, action: () -> Unit) {

@@ -56,6 +56,8 @@ import kotlinx.coroutines.withTimeoutOrNull
  * @param now a monotonic clock in milliseconds.
  * @param takeSpeakers false for automatic reconnects: power on then claims nothing and leaves
  *   another source playing.
+ * @param inheritedUnitMute the head unit is muted by this app, through the tuner this one replaces
+ *   after a lost connection ([holdsUnitMute]): this one lifts it as that one would have.
  * @param trace one line per decision, in Portuguese, for the diagnostics screen.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -66,6 +68,7 @@ class NwdTuner(
     private val commandDispatcher: CoroutineDispatcher = Dispatchers.IO.limitedParallelism(1),
     private val now: () -> Long = { System.nanoTime() / 1_000_000 },
     private val takeSpeakers: Boolean = true,
+    inheritedUnitMute: Boolean = false,
     private val trace: (String) -> Unit = {},
 ) : Tuner {
 
@@ -102,6 +105,12 @@ class NwdTuner(
 
     override val usesHeadUnitBand = true
 
+    /**
+     * A mute this app sent to the whole head unit is still in force, as far as this tuner knows. It
+     * outlives a lost connection, for the tuner that replaces this one ([inheritedUnitMute]).
+     */
+    val holdsUnitMute: Boolean get() = mutedByApp
+
     private val _state = MutableStateFlow(TunerState())
     override val state: StateFlow<TunerState> = _state.asStateFlow()
 
@@ -130,6 +139,11 @@ class NwdTuner(
     /** The FM station the service was last on while the unit was awake. */
     @Volatile private var station: Int? = null
     @Volatile private var stationBeforeSleep: Int? = null
+    /**
+     * The station to put back after the unit woke up on another source, once the radio is the
+     * source again. Until then the dial keeps showing it, so the vendor's station is never saved.
+     */
+    @Volatile private var wakeRestore: Int? = null
     /** Bumped on every station change, so a radio text read across one can be dropped. */
     @Volatile private var stationEpoch = 0
     @Volatile private var radioState: Int? = null
@@ -143,8 +157,15 @@ class NwdTuner(
     @Volatile private var unitMuted: Boolean? = null
     /** A mute sent by this app is in force. It silences the whole head unit, every source included. */
     @Volatile private var mutedByApp = false
+    /** Taken over by the first power on. */
+    @Volatile private var inheritedMute = inheritedUnitMute
     @Volatile private var mcuState: Int? = null
     @Volatile private var lastClaimAt: Long? = null
+    /**
+     * Both ways of claiming went out and `mcu_current_source` never showed the radio. The radio may
+     * play anyway, with a setting that does not follow, so tunes and seeks stop waiting for it.
+     */
+    @Volatile private var claimUnverified = false
     @Volatile private var lastBandChangeAt: Long? = null
 
     // The stale window of the last tune: notices of anything else are older than it.
@@ -156,6 +177,8 @@ class NwdTuner(
     @Volatile private var seekFrom: Int? = null
     @Volatile private var firstMove: Int? = null
     @Volatile private var busySeen = false
+    /** A tune handed over before the seek that had not landed when it started (see onFrequency). */
+    @Volatile private var strayRaw: Int? = null
 
     // What the app asked for. Settings can arrive before the service is connected, so they are
     // kept here and sent once it is, and only when the service reports something different.
@@ -177,7 +200,11 @@ class NwdTuner(
                 connectionLost = false,
             )
         }
+        // A mute this app set stays this app's to lift, across a lost connection (see onSource).
+        val heldMute = mutedByApp || inheritedMute
+        inheritedMute = false
         resetSession(region)
+        mutedByApp = heldMute
         try {
             val service = withTimeout(timing.connectMs) { connect() }
             val scope = CoroutineScope(
@@ -200,6 +227,8 @@ class NwdTuner(
             optional { readNearOn() }
             optional { readPilot() }
             readSettings()
+            // Undone meanwhile, by hand or by another source taking over (see onSource).
+            if (unitMuted == false) mutedByApp = false
 
             // An automatic reconnect leaves another source, and the unit's mute, as they are.
             val radioWanted = takeSpeakers || source.value == Nwd.Source.RADIO
@@ -253,6 +282,7 @@ class NwdTuner(
     override suspend fun tune(frequencyKhz: Int) {
         if (service == null) return
         cancelRestore()
+        wakeRestore = null
         attached {
             operation.withLock { tuneLocked(_state.value.region.snap(frequencyKhz)) }
         }
@@ -261,6 +291,7 @@ class NwdTuner(
     override suspend fun seek(direction: SeekDirection, wrap: Boolean): FoundStation? {
         if (service == null) return null
         cancelRestore()
+        wakeRestore = null
         return attached {
             operation.withLock { seekLocked(direction) }
         }
@@ -441,15 +472,28 @@ class NwdTuner(
         ensureSource()
         ensureFm()
         awaitReady()
+        // A tune handed over just before (a cancelled tap, or the restore) may still be landing, and
+        // its landing would read as this seek's first move: the way the seek went would be learned
+        // wrong for the whole session.
+        val handed = pendingRaw
+        if (handed != null) {
+            withTimeoutOrNull(timing.confirmMs) {
+                while (!(sender ?: throw Detached()).idle || (!pendingMatched && !readFrequency().isAt(handed))) {
+                    delay(timing.tunePollMs)
+                }
+            }
+        }
         pendingRaw = null
         val origin = readFrequency()?.takeIf { Nwd.Band.isFm(it.band) && it.frequency > 0 }?.frequency
             ?: plan.toRaw(_state.value.frequencyKhz)
+        strayRaw = handed?.takeIf { it != origin }
         _state.update { it.copy(activity = TunerActivity.SEEKING) }
         val end = try {
             val first = seekOnce(direction, origin)
             if (first.advice == NwdSeekStrategy.Advice.RETRY_OTHER) seekOnce(direction, first.end).end else first.end
         } finally {
             seekFrom = null
+            strayRaw = null
             _state.update { it.copy(activity = TunerActivity.IDLE) }
         }
         // The service wraps around the band by itself, so wrap cannot be honoured here.
@@ -465,15 +509,17 @@ class NwdTuner(
         busySeen = false
         command { if (call == SeekCall.SEARCH) it.search(up) else it.seek(up) }
         if (awaitSeekStart(from)) awaitSeekDone()
+        // Where a late tune landed, when it did before the seek moved (see onFrequency).
+        val start = seekFrom ?: from
         val end = optional { readFrequency() }?.takeIf { Nwd.Band.isFm(it.band) && it.frequency > 0 }?.frequency
             ?: reading?.takeIf { Nwd.Band.isFm(it.band) && it.frequency > 0 }?.frequency
-            ?: from
-        val channels = channelsMoved(from, end, direction)
-        val wentUp = firstMove?.let { shortestMove(from, it) > 0 }
+            ?: start
+        val channels = channelsMoved(start, end, direction)
+        val wentUp = firstMove?.let { shortestMove(start, it) > 0 }
         val advice = seekStrategy.record(call, direction, wentUp, channels, busySeen)
         log(
             "Busca ${call.label}($up) para ${if (direction == SeekDirection.UP) "cima" else "baixo"}: " +
-                "$from → $end, ${signed(channels)} canais, ocupado: ${if (busySeen) "sim" else "não"}" +
+                "$start → $end, ${signed(channels)} canais, ocupado: ${if (busySeen) "sim" else "não"}" +
                 if (advice == NwdSeekStrategy.Advice.RETRY_OTHER) "; tentando ${seekStrategy.call.label}" else "",
         )
         return SeekRun(end, advice)
@@ -595,12 +641,7 @@ class NwdTuner(
             log("Pedido de fonte recente; só esperando por ele")
             return before == null || awaitRadioSource(timing.claimMs - (now() - last))
         }
-        val steps = if (radioType <= Nwd.RadioType.MCU) {
-            listOf(ClaimStep.REQUEST, ClaimStep.APP_IN)
-        } else {
-            listOf(ClaimStep.APP_IN, ClaimStep.REQUEST)
-        }
-        for (step in steps) {
+        for (step in claimSteps()) {
             val started = now()
             sendClaim(step)
             if (before == null) {
@@ -613,7 +654,15 @@ class NwdTuner(
             }
             log("${step.label}: a fonte continua ${source.value} depois de ${timing.claimMs} ms")
         }
+        if (!claimUnverified) log("A fonte não mostrou o rádio depois dos dois pedidos; sintonias e buscas não esperam mais por ela")
+        claimUnverified = true
         return false
+    }
+
+    private fun claimSteps() = if (radioType <= Nwd.RadioType.MCU) {
+        listOf(ClaimStep.REQUEST, ClaimStep.APP_IN)
+    } else {
+        listOf(ClaimStep.APP_IN, ClaimStep.REQUEST)
     }
 
     private suspend fun sendClaim(step: ClaimStep) {
@@ -637,10 +686,24 @@ class NwdTuner(
         true
     } ?: false
 
-    /** Claims the source for a tune or a seek when it is known to be another one. */
+    /**
+     * Claims the source for a tune or a seek when it is known to be another one. After a claim the
+     * source never confirmed, only the first way of asking goes out again, no more often than
+     * [Timing.claimMs], and nothing is waited for, so the dial does not freeze on every tap.
+     */
     private suspend fun ensureSource() {
         val current = readSource()
-        if (current != null && current != Nwd.Source.RADIO) claim()
+        if (current == null || current == Nwd.Source.RADIO) return
+        if (!claimUnverified) {
+            claim()
+            return
+        }
+        if (inCall()) return
+        val last = lastClaimAt
+        if (last != null && now() - last < timing.claimMs) return
+        val step = claimSteps().first()
+        sendClaim(step)
+        log("${step.label} reenviado sem esperar: a fonte é $current")
     }
 
     /**
@@ -738,7 +801,7 @@ class NwdTuner(
     }
 
     private suspend fun pollRadioText() {
-        if (!reading.let { it != null && Nwd.Band.isFm(it.band) } || windowOpen()) return
+        if (!reading.let { it != null && Nwd.Band.isFm(it.band) } || windowOpen() || !showsReading()) return
         val epoch = stationEpoch
         val text = query { it.getRtMessage() }
         // The text of a station the dial left while it was being read would land on the new one.
@@ -791,7 +854,7 @@ class NwdTuner(
             is NwdEvent.NearOnChanged -> onNearOn(event.on)
             is NwdEvent.StereoPilotChanged -> onPilot(event.stereo)
             is NwdEvent.RadioTextChanged ->
-                if (_state.value.rdsEnabled && !windowOpen() && reading.let { it != null && Nwd.Band.isFm(it.band) }) {
+                if (_state.value.rdsEnabled && !windowOpen() && showsReading() && reading.let { it != null && Nwd.Band.isFm(it.band) }) {
                     showRadioText(event.text)
                 }
             is NwdEvent.RadioPointChanged -> NwdBandPlan.fromRadioPoints(event.points)?.let {
@@ -814,7 +877,13 @@ class NwdTuner(
         if (from != null && firstMove == null && Nwd.Band.isFm(frequency.band) &&
             frequency.frequency > 0 && frequency.frequency != from
         ) {
-            firstMove = frequency.frequency
+            if (frequency.frequency == strayRaw) {
+                // The tune handed over before the seek landed only now: the seek moves from there.
+                strayRaw = null
+                seekFrom = frequency.frequency
+            } else {
+                firstMove = frequency.frequency
+            }
         }
         val pending = pendingRaw
         if (pending != null) {
@@ -845,6 +914,7 @@ class NwdTuner(
         val newStation = previous == null || !Nwd.Band.isFm(previous.band) || previous.frequency != frequency.frequency
         if (newStation) stationEpoch++
         if (awake()) station = frequency.frequency
+        if (!showsReading()) return
         val khz = plan.toKhz(frequency.frequency)
         val name = cleanText(frequency.programService)
         _state.update {
@@ -882,6 +952,8 @@ class NwdTuner(
         radioState = state
         if (Nwd.State.isBusy(state) && seekFrom != null) busySeen = true
         if (state == Nwd.State.NORMAL) readyNeverSeen = false
+        // A scan notice whose end never arrived: the service says it is idle, and no seek of ours runs.
+        if (state == Nwd.State.NORMAL && seekFrom == null) scanState = 0
         updateBusy()
     }
 
@@ -910,6 +982,14 @@ class NwdTuner(
         val before = source.value
         source.value = id
         if (before != id) log("Fonte da central: $id")
+        if (id == Nwd.Source.RADIO) {
+            if (claimUnverified) log("A fonte mostrou o rádio; sintonias e buscas voltam a esperar pelo pedido de fonte")
+            claimUnverified = false
+            // Back on the radio after waking up elsewhere: its station goes back now.
+            if (wakeRestore != null && awake() && restoreJob?.isActive != true) {
+                restoreJob = scope?.launch { attached { restoreAfterWake() } }
+            }
+        }
         if (id != Nwd.Source.RADIO && mutedByApp) {
             // Another source took the speakers: it must not play into the radio's mute.
             mutedByApp = false
@@ -930,34 +1010,47 @@ class NwdTuner(
         mcuState = state
         log("Estado da MCU: $state")
         val wasAwake = before == null || before == Nwd.McuState.AWAKE
-        if (wasAwake && state != Nwd.McuState.AWAKE) stationBeforeSleep = station
+        if (wasAwake && state != Nwd.McuState.AWAKE) stationBeforeSleep = wakeRestore ?: station
         if (!wasAwake && state == Nwd.McuState.AWAKE) onWake()
     }
 
     /**
      * The vendor tears FM down when the unit sleeps and may wake up elsewhere. The station is put
-     * back, without claiming: only when the radio is the source again, by itself.
+     * back, without claiming: right away when the radio is the source, else once it is again (see
+     * onSource), unless the user tunes or seeks first.
      */
     private fun onWake() {
         val scope = scope ?: return
         if (_state.value.power != PowerState.ON) return
         val target = stationBeforeSleep ?: station ?: return
         restoreJob?.cancel()
+        wakeRestore = target
         restoreJob = scope.launch {
             attached {
-                val current = readSource()
-                if (current != null && current != Nwd.Source.RADIO && !awaitRadioSource(timing.claimMs)) {
-                    log("A central acordou com outra fonte (${source.value}); nada a restaurar")
+                readSource()
+                if (!radioIsSource()) {
+                    log("A central acordou com outra fonte (${source.value}); $target volta quando o rádio for a fonte")
                     return@attached
                 }
-                operation.withLock {
-                    if (readFrequency().isAt(target)) return@withLock
-                    log("A central acordou fora da estação; voltando para $target")
-                    tuneLocked(plan.toKhz(target), claim = false)
-                }
+                restoreAfterWake()
             }
         }
     }
+
+    private suspend fun restoreAfterWake() = operation.withLock {
+        val target = wakeRestore ?: return@withLock
+        try {
+            if (readFrequency().isAt(target)) return@withLock
+            log("A central acordou fora da estação; voltando para $target")
+            tuneLocked(plan.toKhz(target), claim = false)
+        } finally {
+            // From now on the dial shows what the service reports again (see accept).
+            if (wakeRestore == target) wakeRestore = null
+        }
+    }
+
+    /** False while the unit sleeps or a wake restore is pending: the dial then holds its station. */
+    private fun showsReading(): Boolean = awake() && wakeRestore == null
 
     private fun windowOpen(): Boolean = pendingRaw != null && now() - pendingSince < timing.staleMs
 
@@ -970,6 +1063,7 @@ class NwdTuner(
         fmBand = Nwd.Band.FM1
         station = null
         stationBeforeSleep = null
+        wakeRestore = null
         radioState = null
         scanState = 0
         busySince = null
@@ -979,9 +1073,11 @@ class NwdTuner(
         mutedByApp = false
         mcuState = null
         lastClaimAt = null
+        claimUnverified = false
         lastBandChangeAt = null
         pendingRaw = null
         seekFrom = null
+        strayRaw = null
     }
 
     private fun failOnce(message: String) {

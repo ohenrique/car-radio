@@ -13,6 +13,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -43,15 +44,17 @@ class NwdTunerTest {
     private fun TestScope.tunerFor(
         fake: FakeNwd,
         takeSpeakers: Boolean = true,
+        inheritedUnitMute: Boolean = false,
         trace: (String) -> Unit = { println("${testScheduler.currentTime} ms: $it") },
     ): NwdTuner {
         fake.clock = { testScheduler.currentTime }
-        return tunerFor({ fake }, takeSpeakers, trace)
+        return tunerFor({ fake }, takeSpeakers, inheritedUnitMute, trace)
     }
 
     private fun TestScope.tunerFor(
         connect: suspend () -> NwdService,
         takeSpeakers: Boolean = true,
+        inheritedUnitMute: Boolean = false,
         trace: (String) -> Unit = { println("${testScheduler.currentTime} ms: $it") },
     ) = NwdTuner(
         connect = connect,
@@ -59,8 +62,16 @@ class NwdTunerTest {
         commandDispatcher = StandardTestDispatcher(testScheduler),
         now = { testScheduler.currentTime },
         takeSpeakers = takeSpeakers,
+        inheritedUnitMute = inheritedUnitMute,
         trace = trace,
     ).also { tuners += it }
+
+    /** Every frequency the tuner showed from now on. */
+    private fun TestScope.shownFrequencies(tuner: NwdTuner): List<Int> {
+        val shown = mutableListOf<Int>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { tuner.state.collect { shown += it.frequencyKhz } }
+        return shown
+    }
 
     private val claims = setOf("requestSource", "sendAppInOut", "sendMediaPlay")
 
@@ -176,6 +187,62 @@ class NwdTunerTest {
         tuner.tune(98_500)
         assertEquals(2, fake.named("requestSource").size)
         assertEquals(Nwd.Source.RADIO, fake.source)
+        tuner.powerOff()
+    }
+
+    @Test
+    fun `after a claim the source never showed, tunes and seeks stop waiting for it`() = nwdTest {
+        val lines = mutableListOf<String>()
+        val fake = FakeNwd(requestSwitches = false, appInSwitches = false, frequency = 9_000)
+        val tuner = tunerFor(fake, trace = { lines += it })
+        tuner.powerOn(Region.BRAZIL, 90_000)
+        advanceTimeBy(100)
+        assertTrue(lines.any { it.startsWith("A fonte não mostrou o rádio depois dos dois pedidos") })
+        // The restore asked once more, the first way, without waiting.
+        assertEquals(listOf("requestSource", "sendAppInOut", "requestSource"), fake.claimNames())
+        assertTrue(lines.any { it.startsWith("REQUEST_CHANGE_SOURCE(4) reenviado sem esperar") })
+
+        val start = testScheduler.currentTime
+        tuner.tune(96_100)
+        assertEquals(98_500, tuner.seek(SeekDirection.UP)?.frequencyKhz)
+        tuner.tune(89_100)
+
+        // No wait for the source on any of them, and no claim within three seconds of the last.
+        assertTrue(testScheduler.currentTime - start < 2_000)
+        assertEquals(3, fake.claimNames().size)
+        assertEquals(8_910, fake.frequency)
+        assertEquals(89_100, tuner.state.value.frequencyKhz)
+
+        advanceTimeBy(3_000)
+        val later = testScheduler.currentTime
+        tuner.tune(96_100)
+        assertTrue(testScheduler.currentTime - later < 1_000)
+        assertEquals(listOf("requestSource", "sendAppInOut", "requestSource", "requestSource"), fake.claimNames())
+        assertEquals(Nwd.Source.ANDROID, fake.source)
+        tuner.powerOff()
+    }
+
+    @Test
+    fun `reclaiming still waits for an unconfirmed source, and seeing the radio as the source ends the shortcut`() = nwdTest {
+        val fake = FakeNwd(requestSwitches = false, appInSwitches = false)
+        val tuner = tunerFor(fake)
+        tuner.powerOn(Region.BRAZIL, 98_100)
+        advanceTimeBy(3_100)
+        val claims = fake.claimNames().size
+
+        var start = testScheduler.currentTime
+        tuner.reclaimSource()
+        assertTrue(testScheduler.currentTime - start >= 6_000)
+        assertEquals(listOf("requestSource", "sendAppInOut"), fake.claimNames().drop(claims))
+
+        // The user picks the radio on the unit, then BT takes over again.
+        fake.switchSource(Nwd.Source.RADIO)
+        fake.switchSource(BT_MUSIC)
+        advanceTimeBy(3_100)
+        start = testScheduler.currentTime
+        tuner.tune(96_100)
+        assertTrue(testScheduler.currentTime - start >= 6_000)
+        assertEquals(listOf("requestSource", "sendAppInOut"), fake.claimNames().drop(claims + 2))
         tuner.powerOff()
     }
 
@@ -704,6 +771,31 @@ class NwdTunerTest {
     }
 
     @Test
+    fun `a scan notice whose end never came does not hold tunes back`() = nwdTest {
+        val fake = FakeNwd(ignoresTunes = 1)
+        val tuner = tunerFor(fake)
+        tuner.powerOn(Region.BRAZIL, 98_100)
+        advanceTimeBy(100)
+        fake.pushScanState(1)
+
+        val start = testScheduler.currentTime
+        tuner.tune(96_100)
+
+        // No 30 s wait, and the tune the service ignored was sent again.
+        assertTrue(testScheduler.currentTime - start < 5_000)
+        assertEquals(2, fake.tunes().size)
+        assertEquals(9_610, fake.frequency)
+
+        advanceTimeBy(40_000)
+        fake.ignoresTunes = 1
+        tuner.tune(98_500)
+        assertEquals(4, fake.tunes().size)
+        assertEquals(9_850, fake.frequency)
+        assertEquals(98_500, tuner.state.value.frequencyKhz)
+        tuner.powerOff()
+    }
+
+    @Test
     fun `shows the requested frequency at once and the real one when the tune fails`() = nwdTest {
         val fake = FakeNwd(ignoresTunes = 2)
         val tuner = tunerFor(fake)
@@ -881,6 +973,107 @@ class NwdTunerTest {
         tuner.powerOff()
     }
 
+    @Test
+    fun `the dial holds its station while the unit sleeps`() = nwdTest {
+        val fake = FakeNwd()
+        val tuner = tunerFor(fake)
+        tuner.powerOn(Region.BRAZIL, 98_100)
+        advanceTimeBy(4_000)
+        val shown = shownFrequencies(tuner)
+
+        fake.sleep(forgetTo = 8_750)
+        fake.notify(8_750, "DESLIGANDO")
+        advanceTimeBy(5_000)
+        assertEquals(98_100, tuner.state.value.frequencyKhz)
+        assertNull(tuner.state.value.rds.programService)
+
+        fake.wake()
+        advanceTimeBy(5_000)
+        assertEquals(9_810, fake.frequency)
+        assertEquals(98_100, tuner.state.value.frequencyKhz)
+        assertFalse(87_500 in shown)
+        tuner.powerOff()
+    }
+
+    @Test
+    fun `waking up on another source puts the station back when the app takes the speakers`() = nwdTest {
+        val fake = FakeNwd()
+        val tuner = tunerFor(fake)
+        tuner.powerOn(Region.BRAZIL, 98_100)
+        advanceTimeBy(4_000)
+        fake.switchSource(BT_MUSIC)
+        advanceTimeBy(2_000)
+        val shown = shownFrequencies(tuner)
+
+        fake.sleep(forgetTo = 8_750)
+        advanceTimeBy(3_000)
+        fake.wake()
+        advanceTimeBy(6_000)
+        // Still on BT: nothing tuned, and the vendor's station is never shown, so never saved.
+        assertTrue(fake.tunes().isEmpty())
+        assertEquals(98_100, tuner.state.value.frequencyKhz)
+
+        // The user opens the app.
+        tuner.reclaimSource()
+        advanceTimeBy(6_000)
+
+        assertEquals(Nwd.Source.RADIO, fake.source)
+        assertEquals(listOf(listOf<Any?>(9_810, Nwd.Band.FM1, Nwd.NO_PRESET)), fake.tunes())
+        assertEquals(9_810, fake.frequency)
+        assertEquals(98_100, tuner.state.value.frequencyKhz)
+        assertFalse(87_500 in shown)
+        tuner.powerOff()
+    }
+
+    @Test
+    fun `waking up on another source puts the station back when the unit switches to the radio by itself`() = nwdTest {
+        val fake = FakeNwd(deliversCallbacks = false)
+        val tuner = tunerFor(fake)
+        tuner.powerOn(Region.BRAZIL, 98_100)
+        advanceTimeBy(4_000)
+        fake.switchSource(BT_MUSIC)
+        fake.sleep(forgetTo = 8_750)
+        advanceTimeBy(3_000)
+        fake.wake()
+        advanceTimeBy(6_000)
+        val shown = shownFrequencies(tuner)
+
+        // The source key on the unit.
+        fake.switchSource(Nwd.Source.RADIO)
+        advanceTimeBy(5_000)
+
+        assertEquals(listOf(listOf<Any?>(9_810, Nwd.Band.FM1, Nwd.NO_PRESET)), fake.tunes())
+        assertEquals(9_810, fake.frequency)
+        assertEquals(98_100, tuner.state.value.frequencyKhz)
+        assertEquals(1, fake.named("requestSource").size)
+        assertFalse(87_500 in shown)
+        tuner.powerOff()
+    }
+
+    @Test
+    fun `a tune after waking up on another source drops the station of before the sleep`() = nwdTest {
+        val fake = FakeNwd()
+        val tuner = tunerFor(fake)
+        tuner.powerOn(Region.BRAZIL, 98_100)
+        advanceTimeBy(4_000)
+        fake.switchSource(BT_MUSIC)
+        fake.sleep(forgetTo = 8_750)
+        advanceTimeBy(3_000)
+        fake.wake()
+        advanceTimeBy(6_000)
+
+        tuner.tune(96_100)
+        advanceTimeBy(1_000)
+        fake.switchSource(BT_MUSIC)
+        advanceTimeBy(1_000)
+        fake.switchSource(Nwd.Source.RADIO)
+        advanceTimeBy(5_000)
+
+        assertEquals(listOf(listOf<Any?>(9_610, Nwd.Band.FM1, Nwd.NO_PRESET)), fake.tunes())
+        assertEquals(96_100, tuner.state.value.frequencyKhz)
+        tuner.powerOff()
+    }
+
     // Seeking.
 
     @Test
@@ -997,6 +1190,57 @@ class NwdTunerTest {
         tuner.seek(SeekDirection.UP)
 
         assertEquals(listOf(listOf<Any?>(true), listOf<Any?>(false)), fake.argsOf("search"))
+        tuner.powerOff()
+    }
+
+    @Test
+    fun `a seek right after a cancelled tune moves from where that tune lands`() = nwdTest {
+        // The MCU runs commands in order: the seek starts once the tapped preset has landed.
+        val fake = FakeNwd(scope = backgroundScope, inOrder = true, tuneDelayMs = 300)
+        val tuner = tunerFor(fake)
+        tuner.powerOn(Region.BRAZIL, 98_100)
+        advanceTimeBy(2_000)
+
+        // A preset tap, and seek up before it lands (the controller cancels the tap).
+        val tap = launch { tuner.tune(96_100) }
+        advanceTimeBy(50)
+        tap.cancel()
+        val found = (1..3).map { tuner.seek(SeekDirection.UP)?.frequencyKhz }
+
+        // The landing is not taken for a move down: up stays search(true) for the session.
+        assertEquals(listOf(98_500, 106_300, 89_100), found)
+        assertEquals(listOf(listOf<Any?>(true), listOf<Any?>(true), listOf<Any?>(true)), fake.argsOf("search"))
+        tuner.powerOff()
+    }
+
+    @Test
+    fun `a seek during the power on restore moves from the restored station`() = nwdTest {
+        val fake = FakeNwd(scope = backgroundScope, inOrder = true, tuneDelayMs = 300)
+        val tuner = tunerFor(fake)
+        tuner.powerOn(Region.BRAZIL, 96_100)
+        advanceTimeBy(100)
+
+        val found = (1..2).map { tuner.seek(SeekDirection.UP)?.frequencyKhz }
+
+        assertEquals(listOf(98_500, 106_300), found)
+        assertEquals(listOf(listOf<Any?>(true), listOf<Any?>(true)), fake.argsOf("search"))
+        tuner.powerOff()
+    }
+
+    @Test
+    fun `a tune that lands only after the seek began is not taken for the seek's move`() = nwdTest {
+        val fake = FakeNwd(scope = backgroundScope, inOrder = true, tuneDelayMs = 2_000)
+        val tuner = tunerFor(fake)
+        tuner.powerOn(Region.BRAZIL, 98_100)
+        advanceTimeBy(2_000)
+
+        val tap = launch { tuner.tune(96_100) }
+        advanceTimeBy(50)
+        tap.cancel()
+        val found = (1..2).map { tuner.seek(SeekDirection.UP)?.frequencyKhz }
+
+        assertEquals(listOf(98_500, 106_300), found)
+        assertEquals(listOf(listOf<Any?>(true), listOf<Any?>(true)), fake.argsOf("search"))
         tuner.powerOff()
     }
 
@@ -1347,6 +1591,76 @@ class NwdTunerTest {
         assertFalse(tuner.state.value.muted)
         assertTrue(fake.named("setUnitMuted").isEmpty())
         tuner.powerOff()
+    }
+
+    @Test
+    fun `the tuner that replaces one whose connection was lost still lifts the app's mute`() = nwdTest {
+        val first = FakeNwd(source = Nwd.Source.RADIO)
+        val lost = tunerFor(first)
+        lost.powerOn(Region.BRAZIL, 98_100)
+        lost.setMuted(true)
+        first.die()
+        assertTrue(lost.holdsUnitMute)
+
+        // The service came back with the unit still muted; the reconnect takes nothing.
+        val second = FakeNwd(source = Nwd.Source.RADIO, muted = true)
+        val tuner = tunerFor(second, takeSpeakers = false, inheritedUnitMute = true)
+        tuner.powerOn(Region.BRAZIL, 98_100)
+        advanceTimeBy(3_000)
+        assertTrue(second.muted)
+        assertTrue(second.named("setUnitMuted").isEmpty())
+        assertTrue(tuner.holdsUnitMute)
+
+        second.switchSource(BT_MUSIC)
+
+        assertFalse(second.muted)
+        assertEquals(listOf(listOf<Any?>(false)), second.argsOf("setUnitMuted"))
+        tuner.powerOff()
+        assertEquals(1, second.named("setUnitMuted").size)
+    }
+
+    @Test
+    fun `an inherited mute is lifted by power off, and at once when another source already plays`() = nwdTest {
+        val radio = FakeNwd(source = Nwd.Source.RADIO, muted = true)
+        val tuner = tunerFor(radio, takeSpeakers = false, inheritedUnitMute = true)
+        tuner.powerOn(Region.BRAZIL, 98_100)
+        assertTrue(radio.muted)
+        tuner.powerOff()
+        assertFalse(radio.muted)
+
+        val bt = FakeNwd(source = BT_MUSIC, muted = true)
+        val btTuner = tunerFor(bt, takeSpeakers = false, inheritedUnitMute = true)
+        btTuner.powerOn(Region.BRAZIL, 98_100)
+        assertFalse(bt.muted)
+        assertEquals(BT_MUSIC, bt.source)
+        assertTrue(bt.claimNames().isEmpty())
+        btTuner.powerOff()
+    }
+
+    @Test
+    fun `an inherited mute the unit no longer has is forgotten`() = nwdTest {
+        val fake = FakeNwd(source = Nwd.Source.RADIO)
+        val tuner = tunerFor(fake, takeSpeakers = false, inheritedUnitMute = true)
+        tuner.powerOn(Region.BRAZIL, 98_100)
+        assertFalse(tuner.holdsUnitMute)
+
+        // The user mutes with the unit's own key.
+        fake.setMute(true)
+        fake.switchSource(BT_MUSIC)
+        tuner.powerOff()
+
+        assertTrue(fake.muted)
+        assertTrue(fake.named("setUnitMuted").isEmpty())
+    }
+
+    @Test
+    fun `an inherited mute is kept through a power on that fails`() = nwdTest {
+        val tuner = NwdTuner({ throw NwdException("Não encontrei o serviço de rádio com.nwd.radio.service") }, inheritedUnitMute = true)
+
+        tuner.powerOn(Region.BRAZIL, 98_100)
+
+        assertEquals(PowerState.ERROR, tuner.state.value.power)
+        assertTrue(tuner.holdsUnitMute)
     }
 
     // Status.
