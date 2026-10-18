@@ -82,6 +82,8 @@ class RadioController(
     private var operation: Job? = null
     private var activeSettings: RadioSettings? = null
     private var reconnecting: Job? = null
+    /** The mute [reconnecting] carries over, for a restart that replaces it. */
+    private var reconnectMuteHeld = false
 
     /** Frequency of a tune that was asked for but may not have reached the tuner yet. */
     private var pendingKhz: Int? = null
@@ -115,30 +117,40 @@ class RadioController(
                 if (reconnecting?.isActive == true) return@onEach
                 // Read before the dead tuner is powered off, which forgets it.
                 val unitMuteHeld = (_tuner.value as? NwdTuner)?.holdsUnitMute == true
-                reconnecting = scope.launch { reconnect(takeSpeakers = !lost.muted, unitMuteHeld) }
+                trace("Conexão com o serviço de rádio perdida; religando em $RECONNECT_DELAY_MS ms")
+                launchReconnect(takeSpeakers = !lost.muted, unitMuteHeld)
             }
             .launchIn(scope)
+    }
+
+    private fun launchReconnect(takeSpeakers: Boolean, unitMuteHeld: Boolean) {
+        // One loop at a time: a loss seen while a failed restart starts its own loop is that loop's.
+        reconnecting?.cancel()
+        reconnectMuteHeld = unitMuteHeld
+        reconnecting = scope.launch { reconnect(takeSpeakers, unitMuteHeld) }
     }
 
     /**
      * Binds the radio again after its connection was lost: [RECONNECT_DELAY_MS] later, then twice
      * as long after every attempt that failed, up to [MAX_RECONNECT_DELAY_MS], until the radio is
-     * back or the user starts, stops or reconfigures it. Every attempt uses [takeSpeakers] and
-     * [unitMuteHeld] as they were when the connection was lost: a tuner that failed to start
-     * knows neither.
+     * back or the user stops it. Only the first attempt uses [takeSpeakers]: by a later one the
+     * user may have picked another source, which a reconnect must not switch away from (a radio
+     * still the source plays again anyway). Every attempt keeps [unitMuteHeld], which a tuner that
+     * failed to start does not know.
      */
     private suspend fun reconnect(takeSpeakers: Boolean, unitMuteHeld: Boolean) {
         var wait = RECONNECT_DELAY_MS
-        trace("Conexão com o serviço de rádio perdida; religando em $wait ms")
+        var claim = takeSpeakers
         while (true) {
             delay(wait)
             val done = lifecycle.withLock {
                 // Started, stopped or reconfigured meanwhile.
                 if (_tuner.value.state.value.power != PowerState.ERROR) return@withLock true
-                restart(store.settings.first(), takeSpeakers, unitMuteHeld)
+                restart(store.settings.first(), claim, unitMuteHeld)
                 _tuner.value.state.value.power == PowerState.ON
             }
             if (done) return
+            claim = false
             wait = (wait * 2).coerceAtMost(MAX_RECONNECT_DELAY_MS)
             trace("O rádio não voltou; nova tentativa em $wait ms")
         }
@@ -150,15 +162,17 @@ class RadioController(
      * [takeSpeakers] false, as on an automatic reconnect, the source is left alone.
      */
     fun start(takeSpeakers: Boolean = true) {
-        reconnecting?.cancel()
         scope.launch {
             lifecycle.withLock {
+                // Under the lock, so a reconnect attempt is never cut off in the middle of its claim.
+                val wasReconnecting = reconnecting?.isActive == true
+                reconnecting?.cancel()
                 val settings = store.settings.first()
-                if (state.value.power == PowerState.ON && settings == activeSettings) {
+                if (_tuner.value.state.value.power == PowerState.ON && settings == activeSettings) {
                     if (takeSpeakers) runCatching { _tuner.value.reclaimSource() }
                     return@withLock
                 }
-                restart(settings, takeSpeakers)
+                restartKeepingReconnect(wasReconnecting, settings, takeSpeakers)
             }
         }
     }
@@ -189,8 +203,9 @@ class RadioController(
                     }
                     activeSettings = settings
                 } else {
+                    val wasReconnecting = reconnecting?.isActive == true
                     reconnecting?.cancel()
-                    restart(settings)
+                    restartKeepingReconnect(wasReconnecting, settings, takeSpeakers = true)
                 }
             }
         }
@@ -313,6 +328,19 @@ class RadioController(
         val frequency = store.lastFrequencyKhz() ?: settings.region.defaultFrequencyKhz
         tuner.powerOn(settings.region, frequency)
         activeSettings = settings
+    }
+
+    /**
+     * A restart that replaced a running reconnect keeps its mute, and when it fails too, as while
+     * the service is still down, the retries go on, without taking the speakers.
+     */
+    private suspend fun restartKeepingReconnect(wasReconnecting: Boolean, settings: RadioSettings, takeSpeakers: Boolean) {
+        val muteHeld = wasReconnecting && reconnectMuteHeld
+        restart(settings, takeSpeakers, muteHeld)
+        if (wasReconnecting && _tuner.value.state.value.power == PowerState.ERROR) {
+            trace("O rádio não voltou; nova tentativa em $RECONNECT_DELAY_MS ms")
+            launchReconnect(takeSpeakers = false, muteHeld)
+        }
     }
 
     private fun needsRestart(old: RadioSettings, new: RadioSettings) =

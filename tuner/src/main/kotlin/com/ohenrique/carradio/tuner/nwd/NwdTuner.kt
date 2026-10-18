@@ -22,6 +22,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -1016,8 +1017,9 @@ class NwdTuner(
 
     /**
      * The vendor tears FM down when the unit sleeps and may wake up elsewhere. The station is put
-     * back, without claiming: right away when the radio is the source, else once it is again (see
-     * onSource), unless the user tunes or seeks first.
+     * back, without claiming: right away when the radio is the source, or when the source setting
+     * is known not to follow it ([claimUnverified]), else once it is again (see onSource), unless
+     * the user tunes or seeks first.
      */
     private fun onWake() {
         val scope = scope ?: return
@@ -1028,7 +1030,8 @@ class NwdTuner(
         restoreJob = scope.launch {
             attached {
                 readSource()
-                if (!radioIsSource()) {
+                // A source setting that never showed the radio says nothing about what plays.
+                if (!radioIsSource() && !claimUnverified) {
                     log("A central acordou com outra fonte (${source.value}); $target volta quando o rádio for a fonte")
                     return@attached
                 }
@@ -1044,8 +1047,9 @@ class NwdTuner(
             log("A central acordou fora da estação; voltando para $target")
             tuneLocked(plan.toKhz(target), claim = false)
         } finally {
-            // From now on the dial shows what the service reports again (see accept).
-            if (wakeRestore == target) wakeRestore = null
+            // From now on the dial shows what the service reports again (see accept). A restore
+            // cancelled by a newer wake leaves the station to that wake's restore.
+            if (wakeRestore == target && currentCoroutineContext().isActive) wakeRestore = null
         }
     }
 

@@ -1074,6 +1074,56 @@ class NwdTunerTest {
         tuner.powerOff()
     }
 
+    @Test
+    fun `sleeping again while the wake restore is tuning still restores after the next wake`() = nwdTest {
+        val fake = FakeNwd()
+        val tuner = tunerFor(fake)
+        tuner.powerOn(Region.BRAZIL, 98_100)
+        advanceTimeBy(4_000)
+        fake.sleep(forgetTo = 8_750)
+        advanceTimeBy(3_000)
+        // The first tune after the wake is dropped, so the restore is still waiting when the unit sleeps.
+        fake.ignoresTunes = 1
+        fake.wake()
+        advanceTimeBy(500)
+        fake.sleep(forgetTo = 8_750)
+        fake.ignoresTunes = 1
+        advanceTimeBy(1_000)
+        fake.wake()
+        advanceTimeBy(15_000)
+
+        assertEquals(9_810, fake.frequency)
+        assertEquals(98_100, tuner.state.value.frequencyKhz)
+        tuner.powerOff()
+    }
+
+    @Test
+    fun `after a claim the source never showed, a wake restores at once and the dial follows the service again`() = nwdTest {
+        val fake = FakeNwd(requestSwitches = false, appInSwitches = false)
+        val tuner = tunerFor(fake)
+        tuner.powerOn(Region.BRAZIL, 98_100)
+        advanceTimeBy(4_000)
+        fake.sleep(forgetTo = 8_750)
+        advanceTimeBy(3_000)
+        fake.wake()
+        advanceTimeBy(6_000)
+
+        // Silent: the wake tunes, but claims nothing.
+        assertEquals(9_810, fake.frequency)
+        assertEquals(98_100, tuner.state.value.frequencyKhz)
+        val claimsAfterWake = fake.claimNames().size
+
+        // The unit's own keys, and radio text, still reach the dial.
+        fake.pressStockKey(9_610)
+        fake.pushRadioText("TEXTO")
+        advanceTimeBy(5_000)
+
+        assertEquals(96_100, tuner.state.value.frequencyKhz)
+        assertEquals("TEXTO", tuner.state.value.rds.radioText)
+        assertEquals(claimsAfterWake, fake.claimNames().size)
+        tuner.powerOff()
+    }
+
     // Seeking.
 
     @Test
